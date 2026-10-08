@@ -320,6 +320,7 @@ interface Document {
   date: string;
   size: string;
   tags: string[];
+  ownerId?: string;
   url?: string;
 }
 
@@ -383,8 +384,8 @@ const messages: Message[] = [
 ];
 
 const documents: Document[] = [
-  { id: 'd1', name: 'Lease_Agreement_2026-2027.pdf', type: 'Lease', date: '2026-01-15', size: '2.4 MB', tags: ['2026-02-01', '2027-01-31'] },
-  { id: 'd2', name: 'Rent_Receipt_June_2026.pdf', type: 'Receipt', date: '2026-06-01', size: '120 KB', tags: [] },
+  { id: 'd1', name: 'Lease_Agreement_2026-2027.pdf', type: 'Lease', date: '2026-01-15', size: '2.4 MB', tags: ['2026-02-01', '2027-01-31'], ownerId: undefined },
+  { id: 'd2', name: 'Rent_Receipt_June_2026.pdf', type: 'Receipt', date: '2026-06-01', size: '120 KB', tags: [], ownerId: undefined },
 ];
 
 function createId(prefix = 'id') {
@@ -1795,8 +1796,44 @@ async function startServer() {
     res.status(201).json({ success: true, data: message });
   });
 
-  app.get('/api/documents', (_req, res) => {
-    res.json({ success: true, data: documents });
+  app.get('/api/documents', (req, res) => {
+    const user = (req as AuthRequest).user;
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
+    let data = [...documents];
+    if (user.role === 'tenant') {
+      data = data.filter((document) => !document.ownerId || document.ownerId === user.sub);
+    }
+
+    return res.json({ success: true, data });
+  });
+
+  app.post('/api/documents', (req, res) => {
+    const user = (req as AuthRequest).user;
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
+    const { name, type, date, size, tags, url } = req.body ?? {};
+    if (!name || !type) {
+      return res.status(400).json({ success: false, error: 'Document name and type are required.' });
+    }
+
+    const document: Document = {
+      id: createId('doc'),
+      name: sanitizeString(name),
+      type: sanitizeString(type),
+      date: sanitizeString(date) || new Date().toISOString().split('T')[0],
+      size: sanitizeString(size) || '0 KB',
+      tags: Array.isArray(tags) ? tags.map((tag: unknown) => sanitizeString(String(tag))).filter(Boolean) : [],
+      ownerId: user.role === 'tenant' ? user.sub : undefined,
+      url: sanitizeString(url),
+    };
+
+    documents.unshift(document);
+    return res.status(201).json({ success: true, data: document });
   });
 
   app.post('/api/scan-document', async (req, res) => {

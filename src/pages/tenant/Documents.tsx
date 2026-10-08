@@ -1,8 +1,11 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { FileText, Search, Filter, Download, Eye, Calendar, FileDigit, Upload, Sparkles, Loader2 } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { useAuth } from '../../hooks/useAuth';
 
-const INITIAL_DOCUMENTS: Array<{id: string, name: string, type: string, date: string, size: string, tags?: string[]}> = [
+type DocumentRecord = { id: string; name: string; type: string; date: string; size: string; tags?: string[]; ownerId?: string; url?: string };
+
+const INITIAL_DOCUMENTS: DocumentRecord[] = [
   { id: '1', name: 'Lease_Agreement_2026-2027.pdf', type: 'Lease', date: '2026-01-15', size: '2.4 MB', tags: ['2026-02-01', '2027-01-31'] },
   { id: '2', name: 'Rent_Receipt_June_2026.pdf', type: 'Receipt', date: '2026-06-01', size: '120 KB', tags: [] },
   { id: '3', name: 'Maintenance_Notice_Water.pdf', type: 'Notice', date: '2026-05-20', size: '45 KB', tags: ['2026-05-22'] },
@@ -12,13 +15,32 @@ const INITIAL_DOCUMENTS: Array<{id: string, name: string, type: string, date: st
 ];
 
 export const TenantDocuments = () => {
-  const [documents, setDocuments] = useState(INITIAL_DOCUMENTS);
+  const { fetchWithAuth } = useAuth();
+  const [documents, setDocuments] = useState<DocumentRecord[]>(INITIAL_DOCUMENTS);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterType, setFilterType] = useState('All');
   const [sortBy, setSortBy] = useState('newest');
-  
+
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const loadDocuments = async () => {
+      try {
+        const response = await fetchWithAuth('/api/documents');
+        const result = await response.json() as { success?: boolean; data?: DocumentRecord[]; error?: string };
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || 'Could not load your documents.');
+        }
+        setDocuments(result.data && result.data.length > 0 ? result.data : INITIAL_DOCUMENTS);
+      } catch (error) {
+        console.error(error);
+        setDocuments(INITIAL_DOCUMENTS);
+      }
+    };
+
+    void loadDocuments();
+  }, [fetchWithAuth]);
 
   const filteredDocs = documents.filter(doc => {
     const matchesSearch = doc.name.toLowerCase().includes(searchTerm.toLowerCase());
@@ -73,7 +95,7 @@ export const TenantDocuments = () => {
         const base64Data = e.target?.result as string;
         
         try {
-          const response = await fetch('/api/scan-document', {
+          const response = await fetchWithAuth('/api/scan-document', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -83,24 +105,33 @@ export const TenantDocuments = () => {
             })
           });
 
-          const result = await response.json();
+          const result = await response.json() as { success?: boolean; data?: { type?: string; primaryDate?: string; extractedDates?: string[] }; error?: string };
           if (result.success && result.data) {
-            const newDoc = {
-              id: Date.now().toString(),
-              name: file.name,
-              type: result.data.type || 'Other',
-              date: result.data.primaryDate || new Date().toISOString().split('T')[0],
-              size: formatSize(file.size),
-              tags: result.data.extractedDates || [],
-            };
-            setDocuments(prev => [newDoc, ...prev]);
+            const persistedResponse = await fetchWithAuth('/api/documents', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: file.name,
+                type: result.data.type || 'Other',
+                date: result.data.primaryDate || new Date().toISOString().split('T')[0],
+                size: formatSize(file.size),
+                tags: result.data.extractedDates || [],
+              }),
+            });
+
+            const persisted = await persistedResponse.json() as { success?: boolean; data?: DocumentRecord; error?: string };
+            if (!persistedResponse.ok || !persisted.success || !persisted.data) {
+              throw new Error(persisted.error || 'Could not save the uploaded document.');
+            }
+
+            setDocuments(prev => [persisted.data!, ...prev.filter((doc) => doc.id !== persisted.data!.id)]);
           } else {
             console.error("Scanning failed:", result.error);
             alert("Failed to analyze document: " + (result.error || "Unknown error"));
           }
         } catch (error) {
           console.error("API Error:", error);
-          alert("Network error. Could not process document.");
+          alert(error instanceof Error ? error.message : "Network error. Could not process document.");
         } finally {
           setIsUploading(false);
           // reset input
@@ -213,12 +244,12 @@ export const TenantDocuments = () => {
               {filteredDocs.map((doc) => (
                 <div key={doc.id} className="p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-slate-50 transition-colors group">
                   <div className="flex items-start gap-4">
-                    <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center flex-shrink-0 group-hover:scale-105 transition-transform">
+                    <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
                       {getIconForType(doc.type)}
                     </div>
                     <div>
                       <h3 className="font-semibold text-slate-900 line-clamp-1">{doc.name}</h3>
-                      <div className="flex items-center gap-3 mt-1 mt-1.5 flex-wrap">
+                      <div className="flex items-center gap-3 mt-1.5 flex-wrap">
                         <span className="text-xs text-slate-500 flex items-center gap-1">
                           <Calendar className="w-3 h-3" />
                           {new Date(doc.date).toLocaleDateString()}
