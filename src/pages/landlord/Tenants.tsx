@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useAuth } from '../../hooks/useAuth';
+import { ReportModal } from '../../components/ReportModal';
 
 interface AvailableUnit {
   id: string;
@@ -51,6 +52,7 @@ export function LandlordTenants() {
   const [renewalData, setRenewalData] = useState({ term: '12 Months', rentAmount: '', noticeSent: false });
 
   const [isAddTenantOpen, setIsAddTenantOpen] = useState(false);
+  const [reportTarget, setReportTarget] = useState<{ targetType: 'tenant' | 'landlord'; targetId: string; targetName: string; tenantRef?: string } | null>(null);
   const [isSendingInvite, setIsSendingInvite] = useState(false);
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [inviteResult, setInviteResult] = useState<{ email: string; emailSent: boolean; inviteUrl: string; expiresAt: number } | null>(null);
@@ -84,8 +86,8 @@ export function LandlordTenants() {
         if (!unitsResponse.ok || !unitsData.success) throw new Error(unitsData.error || 'Unable to load units.');
         if (!propertiesResponse.ok || !propertiesData.success) throw new Error(propertiesData.error || 'Unable to load properties.');
 
-        const unitsById = new Map(unitsData.data.map((unit: { id: string; number: string; propertyId: string }) => [unit.id, unit]));
-        const propertiesById = new Map(propertiesData.data.map((property: { id: string; name: string }) => [property.id, property.name]));
+        const unitsById = new Map<string, { id: string; number: string; propertyId: string }>(unitsData.data.map((unit: { id: string; number: string; propertyId: string }) => [unit.id, unit]));
+        const propertiesById = new Map<string, string>(propertiesData.data.map((property: { id: string; name: string }) => [property.id, property.name]));
         const today = new Date().toISOString().slice(0, 10);
         setTenants(tenantsData.data.map((tenant: { id: string; firstName: string; lastName: string; email: string; status: string; unitId?: string; leaseStart?: string; leaseEnd?: string; rent: number }) => {
           const unit = tenant.unitId ? unitsById.get(tenant.unitId) : undefined;
@@ -536,28 +538,39 @@ export function LandlordTenants() {
                     Edit
                   </button>
                 )}
-                <button 
-                  onClick={() => { setSelectedTenant(null); setIsEditingTenant(false); setIsRenewingLease(false); }}
-                  className="p-2 -mr-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full transition-colors"
-                >
-                  <X className="w-5 h-5" />
-                </button>
+                {!isEditingTenant && !isRenewingLease && (
+                  <button
+                    onClick={() => setReportTarget({
+                      targetType: 'tenant',
+                      targetId: selectedTenant.id,
+                      targetName: `${selectedTenant.firstName} ${selectedTenant.lastName}`,
+                      tenantRef: selectedTenant.id,
+                    })}
+                    className="p-2 text-red-600 hover:text-red-700 hover:bg-red-50 rounded-full transition-colors text-sm font-medium pr-3"
+                  >
+                    Report
+                  </button>
+                  )}
+                  <button
+                    onClick={() => { setSelectedTenant(null); setIsEditingTenant(false); setIsRenewingLease(false); }}
+                    className="p-2 -mr-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full transition-colors"
+                    aria-label="Close tenant details"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
-            </div>
+              <div className="flex-1 overflow-y-auto p-4 sm:p-6">
+                {isRenewingLease ? (
+                  <div className="space-y-6">
+                    <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-4">
+                      <p className="text-sm text-indigo-900">
+                        Current lease for {selectedTenant.firstName} {selectedTenant.lastName} ends on{' '}
+                        <span className="font-bold">{selectedTenant.leaseEnd ? new Date(selectedTenant.leaseEnd).toLocaleDateString() : 'No end date set'}</span>.
+                        {' '}Configure their new lease terms below.
+                      </p>
+                    </div>
 
-            <div className="flex-1 overflow-y-auto p-6 sm:p-8 flex flex-col gap-8 sm:gap-10 pb-32">
-              {isRenewingLease ? (
-                <div className="space-y-6">
-                  <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-5 mb-6">
-                    <h4 className="font-semibold text-indigo-900 mb-1 flex items-center gap-2">
-                       <Bell className="w-4 h-4 text-indigo-600" /> Lease Expiring Soon
-                    </h4>
-                    <p className="text-sm text-indigo-700/80">
-                      Current lease for {selectedTenant.firstName} {selectedTenant.lastName} ends on <span className="font-bold">{new Date(selectedTenant.leaseEnd!).toLocaleDateString()}</span>.
-                      Configure their new lease terms below.
-                    </p>
-                  </div>
-                  
                   <div className="space-y-4">
                     <div>
                       <label className="block text-sm font-medium text-slate-700 mb-2">New Lease Term</label>
@@ -945,6 +958,17 @@ export function LandlordTenants() {
         )}
       </div>
       
+      {reportTarget && (
+        <ReportModal
+          open={true}
+          onClose={() => setReportTarget(null)}
+          targetType={reportTarget.targetType}
+          targetId={reportTarget.targetId}
+          targetName={reportTarget.targetName}
+          tenantRef={reportTarget.tenantRef}
+        />
+      )}
+
       {/* Sliding Panel for Add Tenant */}
       <div className={cn(
         "fixed md:absolute top-0 right-0 h-full w-full sm:max-w-[400px] bg-white sm:border-l border-slate-200 shadow-[0_0_40px_rgba(0,0,0,0.1)] transition-transform duration-300 ease-[cubic-bezier(0.2,0.8,0.2,1)] z-50 md:z-40 flex flex-col",

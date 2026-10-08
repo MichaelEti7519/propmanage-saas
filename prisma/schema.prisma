@@ -36,6 +36,27 @@ enum MaintenancePriority {
   High
 }
 
+enum ReportTargetType {
+  landlord
+  tenant
+  property
+}
+
+enum ReportStatus {
+  open
+  reviewing
+  resolved
+  dismissed
+}
+
+enum VerificationStatus {
+  not_started
+  pending
+  verified
+  rejected
+  needs_review
+}
+
 model User {
   id            String            @id @default(cuid())
   firstName     String
@@ -43,12 +64,66 @@ model User {
   email         String            @unique
   passwordHash  String
   role          UserRole
+  phone         String?
+  emailVerificationStatus VerificationStatus @default(pending)
+  phoneVerificationStatus VerificationStatus @default(not_started)
+  identityVerificationStatus VerificationStatus @default(not_started)
+  propertyAuthorizationStatus VerificationStatus @default(not_started)
+  businessRegistrationStatus VerificationStatus @default(not_started)
+  incomeVerificationStatus VerificationStatus @default(not_started)
+  payoutVerificationStatus VerificationStatus @default(not_started)
+  trustScore    Int               @default(100)
+  blacklisted   Boolean           @default(false)
   properties    Property[]        @relation("UserProperties")
   landlordTenants Tenant[]        @relation("LandlordTenants")
   accountTenants Tenant[]        @relation("AccountTenants")
   invitations   TenantInvitation[] @relation("InvitationLandlord")
+  reportsFiled  Report[]          @relation("ReportReporter")
+  reportsReviewed Report[]        @relation("ReportReviewer")
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
+}
+
+model Report {
+  id                String           @id @default(cuid())
+  reporterId        String
+  reporter          User             @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: Restrict)
+  reporterRole      UserRole
+  targetType        ReportTargetType
+  targetId          String
+  targetName        String?
+  propertyId        String?
+  listingId         String?
+  transactionId     String?
+  tenantRef         String?
+  reason            String
+  message           String
+  riskBand          String           @default("medium")
+  escalateForReview Boolean          @default(true)
+  status            ReportStatus     @default(open)
+  resolutionNote    String?
+  reviewedById      String?
+  reviewedBy        User?            @relation("ReportReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt        DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  @@index([status, createdAt])
+  @@index([targetType, targetId])
+}
+
+model ContactInquiry {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  phone     String?
+  reason    String
+  message   String
+  status    String   @default("new")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
 }
 
 model Property {

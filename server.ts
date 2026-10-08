@@ -21,9 +21,36 @@ interface User {
   email: string;
   role: 'landlord' | 'tenant' | 'admin';
   phone?: string;
+  emailVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
+  phoneVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
+  identityVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
+  propertyAuthorizationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
+  businessRegistrationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
+  incomeVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
+  payoutVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
   passwordHash: string;
 }
-
+interface Report {
+  id: string;
+  reporterId: string;
+  reporterRole: 'landlord' | 'tenant' | 'admin';
+  targetType: 'landlord' | 'tenant' | 'property';
+  targetId: string;
+  targetName?: string;
+  propertyId?: string;
+  listingId?: string;
+  transactionId?: string;
+  tenantRef?: string;
+  reason: string;
+  message: string;
+  riskBand: 'low' | 'medium' | 'high';
+  escalateForReview: boolean;
+  status: 'open' | 'reviewing' | 'resolved' | 'dismissed';
+  resolutionNote?: string;
+  reviewedById?: string;
+  reviewedAt?: string;
+  createdAt: string;
+}
 interface AuthRequest extends express.Request {
   user?: {
     sub: string;
@@ -62,13 +89,14 @@ function sanitizeString(value: unknown) {
 
 async function readDatabaseOrFallback<T>(fallback: T, operation: () => Promise<T>): Promise<T> {
   if (!process.env.DATABASE_URL) {
+    console.warn('DATABASE_URL is not configured; serving fallback data.');
     return fallback;
   }
 
   try {
     return await operation();
   } catch (error) {
-    console.warn('Database query failed; using in-memory fallback. Details:', (error as Error).message);
+    console.warn('Database operation failed; serving fallback data:', error instanceof Error ? error.message : error);
     return fallback;
   }
 }
@@ -404,8 +432,12 @@ async function startServer() {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'", "'unsafe-inline'", 'https://cdn.jsdelivr.net'],
         styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", 'data:'],
-        connectSrc: ["'self'", 'https://api.github.com'],
+        imgSrc: ["'self'", 'data:', 'https://images.unsplash.com', 'https://purecatamphetamine.github.io'],
+        connectSrc: [
+          "'self'",
+          'https://api.github.com',
+          ...(process.env.NODE_ENV === 'production' ? [] : ['ws://localhost:*', 'ws://127.0.0.1:*']),
+        ],
         fontSrc: ["'self'", 'https://fonts.gstatic.com'],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
@@ -467,7 +499,7 @@ async function startServer() {
   app.use('/api', apiLimiter);
   app.use('/api/auth', authLimiter);
 
-  const publicApiPaths = ['/api/health', '/api/auth/login', '/api/auth/register'];
+  const publicApiPaths = ['/api/health', '/api/auth/login', '/api/auth/register', '/api/contact'];
   const publicInvitationPath = /^\/api\/tenant-invitations\/[a-f0-9]{64}(?:\/accept)?$/;
   app.use((req, res, next) => {
     if (req.path.startsWith('/api') && !publicApiPaths.includes(req.path) && !publicInvitationPath.test(req.path)) {
@@ -478,6 +510,255 @@ async function startServer() {
 
   app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+  });
+
+  app.post('/api/contact', async (req, res) => {
+    const name = sanitizeString(req.body?.name);
+    const email = sanitizeString(req.body?.email).toLowerCase();
+    const phone = sanitizeString(req.body?.phone);
+    const reason = sanitizeString(req.body?.reason);
+    const message = sanitizeString(req.body?.message);
+    const allowedReasons = ['Sales & Pricing', 'Technical Support', 'Partnership inquiry', 'Other'];
+
+    if (!name || name.length > 120 || !isValidEmail(email) || email.length > 254 || !allowedReasons.includes(reason) || !message || message.length > 4000) {
+      return res.status(400).json({ success: false, error: 'Please provide a valid name, email, inquiry type, and message.' });
+    }
+
+    try {
+      const inquiry = await prisma.contactInquiry.create({
+        data: { name, email, phone: phone || undefined, reason, message },
+        select: { id: true, createdAt: true },
+      });
+      return res.status(201).json({ success: true, inquiry });
+    } catch (error) {
+      console.error('Unable to save contact inquiry:', error);
+      return res.status(503).json({ success: false, error: 'We could not receive your message just now. Please try again shortly or email us directly.' });
+    }
+  });
+
+  app.post('/api/reports', authMiddleware, async (req, res) => {
+    const user = (req as AuthRequest).user;
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
+    const {
+      targetType,
+      targetId,
+      targetName,
+      propertyId,
+      listingId,
+      transactionId,
+      tenantRef,
+      reason,
+      message: submittedMessage,
+      details,
+      riskBand,
+      escalateForReview,
+    } = req.body;
+    const message = submittedMessage ?? details;
+
+    if (!targetType || !targetId || !reason || !message) {
+      return res.status(400).json({
+        success: false,
+        error: 'targetType, targetId, reason, and message are required.',
+      });
+    }
+
+    if (!['landlord', 'tenant', 'property'].includes(targetType)) {
+      return res.status(400).json({ success: false, error: 'Invalid report target type.' });
+    }
+
+    const normalizedRiskBand = ['low', 'medium', 'high'].includes(riskBand) ? riskBand : 'medium';
+
+    if (user.role === 'tenant' && targetType !== 'landlord') {
+      return res.status(403).json({
+        success: false,
+        error: 'Tenants can only report landlords.',
+      });
+    }
+
+    if (user.role === 'landlord' && targetType !== 'tenant') {
+      return res.status(403).json({
+        success: false,
+        error: 'Landlords can only report tenants.',
+      });
+    }
+
+    try {
+      if (user.role === 'tenant') {
+        const tenant = await prisma.tenant.findFirst({
+          where: { userId: user.sub },
+          select: { landlordId: true },
+        });
+        if (!tenant?.landlordId || tenant.landlordId !== targetId) {
+          return res.status(403).json({ success: false, error: 'You can only report the landlord linked to your rental account.' });
+        }
+      }
+      if (user.role === 'landlord') {
+        const tenant = await prisma.tenant.findFirst({
+          where: { id: targetId, landlordId: user.sub },
+          select: { id: true },
+        });
+        if (!tenant) {
+          return res.status(403).json({ success: false, error: 'You can only report a tenant linked to your properties.' });
+        }
+      }
+
+      const report = await prisma.report.create({
+        data: {
+          reporterId: user.sub,
+          reporterRole: user.role,
+          targetType,
+          targetId: sanitizeString(targetId),
+          targetName: sanitizeString(targetName) || undefined,
+          propertyId: sanitizeString(propertyId) || undefined,
+          listingId: sanitizeString(listingId) || undefined,
+          transactionId: sanitizeString(transactionId) || undefined,
+          tenantRef: sanitizeString(tenantRef) || undefined,
+          reason: sanitizeString(reason),
+          message: sanitizeString(message),
+          riskBand: normalizedRiskBand,
+          escalateForReview: typeof escalateForReview === 'boolean' ? escalateForReview : true,
+        },
+      });
+
+      return res.status(201).json({ success: true, report, message: 'Report submitted successfully.' });
+    } catch (error) {
+      console.error('Unable to save report:', error);
+      return res.status(500).json({ success: false, error: 'Unable to save report.' });
+    }
+  });
+
+  app.get('/api/reports', authMiddleware, async (req, res) => {
+    const user = (req as AuthRequest).user;
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
+    try {
+      const reports = await prisma.report.findMany({
+        where: user.role === 'admin' ? undefined : { reporterId: user.sub },
+        include: {
+          reporter: { select: { firstName: true, lastName: true, role: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      const reportsWithTarget = await Promise.all(reports.map(async (report) => {
+        let targetUser = report.targetType === 'landlord'
+          ? await prisma.user.findUnique({
+            where: { id: report.targetId },
+            select: { id: true, firstName: true, lastName: true, trustScore: true, blacklisted: true },
+          })
+          : null;
+
+        if (report.targetType === 'tenant') {
+          const tenant = await prisma.tenant.findUnique({
+            where: { id: report.targetId },
+            select: { user: { select: { id: true, firstName: true, lastName: true, trustScore: true, blacklisted: true } } },
+          });
+          targetUser = tenant?.user ?? await prisma.user.findUnique({
+            where: { id: report.targetId },
+            select: { id: true, firstName: true, lastName: true, trustScore: true, blacklisted: true },
+          });
+        }
+
+        return {
+          ...report,
+          targetProfile: targetUser,
+        };
+      }));
+
+      return res.json({ success: true, reports: reportsWithTarget });
+    } catch (error) {
+      console.error('Unable to load reports:', error);
+      return res.status(500).json({ success: false, error: 'Unable to load reports.' });
+    }
+  });
+
+  app.patch('/api/reports/:id', authMiddleware, requireRole('admin'), async (req, res) => {
+    const user = (req as AuthRequest).user;
+    if (!user) return res.status(401).json({ success: false, error: 'Authentication required.' });
+
+    const { status, trustAdjustment, blacklisted, resolutionNote } = req.body;
+    const validStatuses = ['open', 'reviewing', 'resolved', 'dismissed'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ success: false, error: 'A valid report status is required.' });
+    }
+    if (trustAdjustment !== undefined && (!Number.isInteger(trustAdjustment) || trustAdjustment < -100 || trustAdjustment > 100)) {
+      return res.status(400).json({ success: false, error: 'Trust adjustment must be a whole number from -100 to 100.' });
+    }
+    if (blacklisted !== undefined && typeof blacklisted !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'Blacklist status must be true or false.' });
+    }
+
+    try {
+      const result = await prisma.$transaction(async (transaction) => {
+        const existingReport = await transaction.report.findUnique({ where: { id: req.params.id } });
+        if (!existingReport) return null;
+
+        let targetUser = existingReport.targetType === 'landlord'
+          ? await transaction.user.findUnique({ where: { id: existingReport.targetId } })
+          : null;
+        if (existingReport.targetType === 'tenant') {
+          const tenant = await transaction.tenant.findUnique({
+            where: { id: existingReport.targetId },
+            include: { user: true },
+          });
+          targetUser = tenant?.user ?? await transaction.user.findUnique({ where: { id: existingReport.targetId } });
+        }
+
+        if ((trustAdjustment !== undefined || blacklisted !== undefined) && !targetUser) {
+          throw new Error('This report target does not have a linked platform account for trust review.');
+        }
+
+        const updatedReport = await transaction.report.update({
+          where: { id: existingReport.id },
+          data: {
+            status,
+            resolutionNote: sanitizeString(resolutionNote) || null,
+            reviewedById: status === 'open' ? null : user.sub,
+            reviewedAt: status === 'open' ? null : new Date(),
+          },
+        });
+
+        let updatedTarget = targetUser;
+        if (targetUser && (trustAdjustment !== undefined || blacklisted !== undefined)) {
+          const trustScore = trustAdjustment === undefined
+            ? targetUser.trustScore
+            : Math.max(0, Math.min(100, targetUser.trustScore + trustAdjustment));
+          updatedTarget = await transaction.user.update({
+            where: { id: targetUser.id },
+            data: {
+              trustScore,
+              ...(blacklisted === undefined ? {} : { blacklisted }),
+            },
+          });
+        }
+
+        return {
+          report: updatedReport,
+          targetProfile: updatedTarget && {
+            id: updatedTarget.id,
+            firstName: updatedTarget.firstName,
+            lastName: updatedTarget.lastName,
+            trustScore: updatedTarget.trustScore,
+            blacklisted: updatedTarget.blacklisted,
+          },
+        };
+      });
+
+      if (!result) return res.status(404).json({ success: false, error: 'Report not found.' });
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to update report.';
+      if (message.includes('does not have a linked platform account')) {
+        return res.status(400).json({ success: false, error: message });
+      }
+      console.error('Unable to update report:', error);
+      return res.status(500).json({ success: false, error: 'Unable to update report.' });
+    }
   });
 
   app.post('/api/auth/register', async (req, res) => {
@@ -500,24 +781,56 @@ async function startServer() {
     if (!ALLOWED_REGISTRATION_ROLES.includes(role)) {
       return res.status(403).json({ success: false, error: 'Registration is not allowed for this role.' });
     }
-    if (users.some((user) => user.email === email)) {
-      return res.status(409).json({ success: false, error: 'Email is already registered.' });
-    }
-
     const passwordHash = await bcrypt.hash(password, 10);
-    const newUser: User = {
-      id: createId('user'),
-      firstName,
-      lastName,
-      email: email.toLowerCase(),
-      role,
-      phone,
-      passwordHash,
-    };
-    users.push(newUser);
-
-    const token = createAuthToken(newUser);
-    res.status(201).json({ success: true, user: { id: newUser.id, firstName: newUser.firstName, lastName: newUser.lastName, email: newUser.email, role: newUser.role }, token });
+    try {
+      const dbUser = await prisma.user.create({
+        data: {
+          firstName,
+          lastName,
+          email,
+          passwordHash,
+          role,
+          phone,
+          emailVerificationStatus: 'pending',
+          phoneVerificationStatus: phone ? 'pending' : 'not_started',
+          identityVerificationStatus: 'not_started',
+          ...(role === 'landlord' ? {
+            propertyAuthorizationStatus: 'not_started',
+            businessRegistrationStatus: 'not_started',
+            payoutVerificationStatus: 'not_started',
+          } : {
+            incomeVerificationStatus: 'not_started',
+          }),
+        },
+      });
+      const newUser: User = { ...dbUser, phone: dbUser.phone ?? undefined };
+      users.push(newUser);
+      const token = createAuthToken(newUser);
+      return res.status(201).json({
+        success: true,
+        user: {
+          id: newUser.id,
+          firstName: newUser.firstName,
+          lastName: newUser.lastName,
+          email: newUser.email,
+          role: newUser.role,
+          emailVerificationStatus: newUser.emailVerificationStatus,
+          phoneVerificationStatus: newUser.phoneVerificationStatus,
+          identityVerificationStatus: newUser.identityVerificationStatus,
+          propertyAuthorizationStatus: newUser.propertyAuthorizationStatus,
+          businessRegistrationStatus: newUser.businessRegistrationStatus,
+          incomeVerificationStatus: newUser.incomeVerificationStatus,
+          payoutVerificationStatus: newUser.payoutVerificationStatus,
+        },
+        token,
+      });
+    } catch (error) {
+      if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') {
+        return res.status(409).json({ success: false, error: 'Email is already registered.' });
+      }
+      console.error('Unable to register account:', error);
+      return res.status(503).json({ success: false, error: 'Account service is temporarily unavailable. Please try again shortly.' });
+    }
   });
 
   app.post('/api/auth/login', async (req, res) => {
@@ -537,7 +850,14 @@ async function startServer() {
       return res.status(429).json({ success: false, error: 'Too many failed login attempts. Please try again later.' });
     }
 
-    const user = users.find((item) => item.email === email);
+    let user: User | null;
+    try {
+      const dbUser = await prisma.user.findUnique({ where: { email } });
+      user = dbUser ? { ...dbUser, phone: dbUser.phone ?? undefined } : null;
+    } catch (error) {
+      console.error('Unable to load account for login:', error);
+      return res.status(503).json({ success: false, error: 'Account service is temporarily unavailable. Please try again shortly.' });
+    }
     if (!user) {
       // increment failed attempts
       if (!loginAttempts[email]) loginAttempts[email] = { count: 1, firstFailedAt: Date.now() };
@@ -1285,9 +1605,10 @@ async function startServer() {
 
       const records = await prisma.tenant.findMany({
         where,
+        include: { landlord: { select: { id: true, firstName: true, lastName: true } } },
         orderBy: { createdAt: 'desc' },
       });
-      return records.map(mapDbTenant);
+      return records.map((record) => ({ ...mapDbTenant(record), landlord: record.landlord }));
     });
 
     if (dbTenants !== undefined) {

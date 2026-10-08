@@ -101,6 +101,83 @@ In progress:
 - `prisma/seed.ts` — sample seed data
 - `prisma.config.ts` — Prisma 7 config
 
+## What You Can Actually Access (And How)
+
+Access in this app is role-based and enforced in both the frontend and backend. The user must log in with a valid JWT, and the route or API call is then checked against their role.
+
+### Public access
+Anyone can view:
+- landing page
+- about page
+- contact page
+- login / register page
+- tenant invite page via a token URL such as `/invite/:token`
+
+These pages do not require an authenticated session.
+
+### Landlord access
+A user with the `landlord` role can access the dashboard at `/landlord` and the following sections:
+- Dashboard
+- Properties
+- Units
+- Tenants
+- Payments
+- Reports
+- Messages
+- Maintenance
+- Analytics
+- Settings
+
+This area is protected by `RequireAuth allowedRoles={['landlord']}` in the frontend and `requireRole('landlord')`-style checks on the backend when data is being accessed or modified.
+
+### Tenant access
+A user with the `tenant` role can access the dashboard at `/tenant` and the following sections:
+- Dashboard
+- Payments
+- Maintenance
+- Messages
+- Documents
+- Settings
+
+A tenant sees only the tenant-specific views and should not be able to reach landlord-only routes.
+
+### Admin access
+A user with the `admin` role can access the full platform dashboard at `/admin` and see administrative views for:
+- system overview
+- global directory
+- all units
+- user accounts
+- platform revenue
+- support desk
+- system health
+- global metrics
+- compliance logs
+- settings
+
+This is reserved for internal platform administration and should not be exposed to normal landlords or tenants.
+
+### How access is enforced
+The app checks access in two places:
+1. Frontend route guards prevent users from opening unauthorized pages.
+2. Backend auth middleware and role validation protect API endpoints.
+
+If a token is missing, expired, or not allowed for the resource, the API responds with a `401` or `403` error instead of returning user data.
+
+### Verification status and data minimization
+The current signup flow collects account name, email, role, and an optional phone number. New email and phone values are not verified by OTP yet. Registration does not collect government ID images or numbers, property deeds, bank details, payslips, or emergency-contact information.
+
+The schema now has status fields for email, phone, identity, property authorization, business registration, tenant income, and payout verification. These statuses are scaffolding only; a status must not be shown as verified until a configured provider or approved reviewer has completed and recorded the check. No KYC vendor, OTP provider, or connected payout provider is configured yet.
+
+When providers are selected, use hosted or tokenized collection where possible. Store only the provider reference, check type, status, timestamps, and limited audit metadata. Do not expose source documents to landlords or tenants. Emergency-contact details should only be collected when needed, with notice and consent from the person providing them.
+
+## Fraud reports and legal requests
+
+The report UI and API support submission, an admin review status, and explicit admin trust-score or blacklist changes. Those changes are review tools and do not automatically suspend accounts or freeze payouts. Report persistence and the new schema require a database migration before use.
+
+Reports are not a substitute for contacting emergency services or law enforcement. Do not disclose a user's hidden identity, private address, ID, or financial details directly to another user. Any disclosure to law enforcement or a court must be reviewed and handled only through lawful process, limited to what is required, and logged under a defined retention and access policy.
+
+The platform does not currently process rent through a connected payment provider, verify property ownership, run automated KYC, or maintain secure vault storage for verification documents. Do not claim these protections are live until integrations, controls, incident procedures, and legal review are complete.
+
 ## Database model
 
 The current schema includes:
@@ -113,6 +190,8 @@ The current schema includes:
 - MaintenanceRequest
 - Message
 - Document
+- Report
+- ContactInquiry
 
 This is the foundation for the landlord SaaS workflow: properties owned by landlords, rental units inside properties, tenant assignments, invite-based onboarding, and rent/maintenance records.
 
@@ -120,16 +199,22 @@ This is the foundation for the landlord SaaS workflow: properties owned by landl
 
 - JWT secrets should never be committed to source control.
 - Use a real Postgres database instead of in-memory arrays for production data.
+- Legacy CRUD routes fall back to in-memory data when the database is unavailable to keep development screens responsive; that data is volatile and must not be treated as a successful production write.
+- Report and contact submissions require durable database storage and return an error when persistence is unavailable rather than reporting a false success.
+- Apply the pending Prisma schema changes after configuring and starting the intended development database; do not point migration commands at production without review.
 - Keep tenant invitation tokens single-use and short-lived.
 - Do not expose admin secrets or private keys in frontend code.
+- Do not accept identity, income, property-title, or bank documents until a provider-hosted or separately secured storage flow and retention policy are in place.
 
 ## Next milestones
 
 1. finish all database-backed CRUD routes
 2. complete tenant invite acceptance persistence
 3. add Stripe-based rent payment workflow
-4. add file upload and document storage
-5. deploy to a real environment and harden production config
+4. select Nigeria-focused KYC, OTP, and payout providers; obtain privacy/legal review
+5. implement provider-hosted verification callbacks and audited status changes
+6. define lawful disclosure, retention, access, and incident-response procedures before handling sensitive documents
+7. deploy to a real environment and harden production config
 
 ## License
 

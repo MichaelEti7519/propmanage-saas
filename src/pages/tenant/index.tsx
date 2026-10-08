@@ -1,7 +1,9 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Home, Phone, Mail, FileText, AlertCircle, Clock, ShieldCheck, CreditCard, ChevronRight, CheckCircle2, Circle, TrendingUp } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { cn } from '../../lib/utils';
+import { ReportModal } from '../../components/ReportModal';
+import { useAuth } from '../../hooks/useAuth';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
 // Mock Landlord Data for the context
@@ -39,7 +41,27 @@ const MOCK_PAYMENT_TRENDS = [
 
 
 export const TenantDashboard = () => {
+  const { fetchWithAuth } = useAuth();
   const [checklist, setChecklist] = useState(INITIAL_CHECKLIST);
+  const [reportTarget, setReportTarget] = useState<{ targetType: 'tenant' | 'landlord'; targetId: string; targetName: string } | null>(null);
+  const [linkedLandlord, setLinkedLandlord] = useState<{ id: string; name: string } | null>(null);
+
+  useEffect(() => {
+    async function loadLinkedLandlord() {
+      try {
+        const response = await fetchWithAuth('/api/tenants');
+        const data = await response.json();
+        if (!response.ok || !data.success || !Array.isArray(data.data)) return;
+        const landlord = data.data[0]?.landlord;
+        if (landlord?.id) {
+          setLinkedLandlord({ id: landlord.id, name: `${landlord.firstName} ${landlord.lastName}` });
+        }
+      } catch {
+        setLinkedLandlord(null);
+      }
+    }
+    loadLinkedLandlord();
+  }, [fetchWithAuth]);
 
   const toggleChecklist = (id: string) => {
     setChecklist(prev => prev.map(item => item.id === id ? { ...item, completed: !item.completed } : item));
@@ -58,6 +80,15 @@ export const TenantDashboard = () => {
   return (
     <div className="p-4 sm:p-8 flex-1 overflow-y-auto mb-16 md:mb-0 bg-slate-50">
       <div className="max-w-6xl mx-auto space-y-6 sm:space-y-8">
+        {reportTarget && (
+          <ReportModal
+            open={true}
+            onClose={() => setReportTarget(null)}
+            targetType={reportTarget.targetType}
+            targetId={reportTarget.targetId}
+            targetName={reportTarget.targetName}
+          />
+        )}
         
         {/* Payment Reminder Alert */}
         {showPaymentReminder && (
@@ -98,6 +129,23 @@ export const TenantDashboard = () => {
               <p className="text-sm font-bold text-slate-900">{MOCK_LANDLORD.name}</p>
             </div>
           </div>
+        </div>
+
+        <div className="flex justify-end">
+          <button
+            type="button"
+            disabled={!linkedLandlord}
+            onClick={() => linkedLandlord && setReportTarget({
+              targetType: 'landlord',
+              targetId: linkedLandlord.id,
+              targetName: linkedLandlord.name,
+            })}
+            className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"
+            title={linkedLandlord ? 'Report the landlord linked to this rental account' : 'A landlord must be linked to this account before submitting a report'}
+          >
+            <AlertCircle className="h-4 w-4" />
+            Report Landlord
+          </button>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

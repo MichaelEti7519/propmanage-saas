@@ -2,7 +2,7 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, Outlet } from 'react-router-dom';
 import { PublicLayout } from './layouts/PublicLayout';
 import { DashboardLayout } from './layouts/DashboardLayout';
-import { Landing, About, Contact, LoginRegister, NotFound } from './pages/public';
+import { Landing, About, Contact, LoginRegister, NotFound, Pricing, PrivacyPolicy, ThankYou } from './pages/public';
 import { TenantInvite } from './pages/public/TenantInvite';
 import { useAuth } from './hooks/useAuth';
 import { 
@@ -80,10 +80,13 @@ export default function App() {
         <Route element={<PublicLayout />}>
           <Route path="/" element={<Landing />} />
           <Route path="/about" element={<About />} />
-          <Route path="/pricing" element={<Navigate to="/contact" replace />} />
+          <Route path="/pricing" element={<Pricing />} />
           <Route path="/contact" element={<Contact />} />
+          <Route path="/privacy" element={<PrivacyPolicy />} />
+          <Route path="/thank-you" element={<ThankYou />} />
           <Route path="/login" element={<LoginRegister />} />
           <Route path="/invite/:token" element={<TenantInvite />} />
+          <Route path="*" element={<NotFound />} />
         </Route>
 
         {/* Tenant Routes */}
@@ -143,8 +146,6 @@ export default function App() {
           <Route path="settings" element={<AdminSettings />} />
         </Route>
 
-        {/* Fallback */}
-        <Route path="*" element={<NotFound />} />
       </Routes>
     </Router>
   );
