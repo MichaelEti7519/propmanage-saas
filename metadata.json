@@ -1,0 +1,8 @@
+{
+  "name": "PropManage SaaS",
+  "description": "Comprehensive full-stack Landlord Management System with tenant, landlord, and admin portals.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
