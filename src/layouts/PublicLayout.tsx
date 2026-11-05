@@ -1,97 +1,322 @@
-import React, { useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
-import { Building2, Menu, X } from 'lucide-react';
-import { motion } from 'motion/react';
+import { ArrowUpRight, Building2, Menu, X } from 'lucide-react';
+import { AnimatePresence, MotionConfig, motion } from 'motion/react';
+
+const navLinks = [
+  { name: 'Home', path: '/' },
+  { name: 'Features', path: '/#features' },
+  { name: 'Workflows', path: '/#workflows' },
+  { name: 'FAQ', path: '/#faq' },
+  { name: 'Pricing', path: '/pricing' },
+  { name: 'Contact', path: '/contact' },
+];
+
+const isLinkActive = (path: string, pathname: string, hash: string) => {
+  if (path.includes('#')) {
+    const [targetPath, targetHash] = path.split('#');
+
+    return pathname === (targetPath || '/') && hash === `#${targetHash}`;
+  }
+
+  // Route links should remain active regardless of URL hash.
+  if (path === '/') {
+    return pathname === '/' && !hash;
+  }
+
+  return pathname === path;
+};
 
 export function PublicLayout() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const location = useLocation();
 
-  React.useEffect(() => {
+  useEffect(() => {
     setIsMobileMenuOpen(false);
-  }, [location]);
+  }, [location.pathname, location.search, location.hash, location.key]);
 
-  React.useEffect(() => {
+  // No hash = new page or Home, so jump to the top BEFORE the browser paints.
+  // 'instant' ignores any global `scroll-behavior: smooth` in your CSS.
+  useLayoutEffect(() => {
+    if (location.hash) return;
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+  }, [location.pathname, location.hash, location.key]);
+
+  useEffect(() => {
+    const reduceMotion = window.matchMedia(
+      '(prefers-reduced-motion: reduce)',
+    ).matches;
     const sectionId = location.hash.slice(1);
-    if (!sectionId) return;
-    window.requestAnimationFrame(() => document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth' }));
-  }, [location]);
 
-  const navLinks = [
-    { name: 'Home', path: '/' },
-    { name: 'Features', path: '/#features' },
-    { name: 'Workflows', path: '/#workflows' },
-    { name: 'FAQ', path: '/#faq' },
-    { name: 'Pricing', path: '/pricing' },
-    { name: 'Contact', path: '/contact' },
-  ];
+    if (!sectionId) return;
+
+    let firstFrame = 0;
+    let secondFrame = 0;
+
+    // Allow the destination route to render before scrolling.
+    firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        document.getElementById(sectionId)?.scrollIntoView({
+          behavior: reduceMotion ? 'auto' : 'smooth',
+          block: 'start',
+        });
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      window.cancelAnimationFrame(secondFrame);
+    };
+    // location.key changes on every navigation, so re-clicking the same hash link works.
+  }, [location.pathname, location.hash, location.key]);
+
+  const linkIsActive = (path: string) =>
+    isLinkActive(path, location.pathname, location.hash);
+
+  // The pill is positioned relative to the nav (offsetLeft/offsetWidth), so
+  // page scroll can never affect it, unlike layoutId which measures in page space.
+  const navRef = useRef<HTMLElement>(null);
+  const linkRefs = useRef<Record<string, HTMLAnchorElement | null>>({});
+  const [pill, setPill] = useState<{ x: number; width: number } | null>(null);
+  const activePath = navLinks.find((link) => linkIsActive(link.path))?.path;
+
+  useLayoutEffect(() => {
+    const measure = () => {
+      const el = activePath ? linkRefs.current[activePath] : null;
+      const next = el ? { x: el.offsetLeft, width: el.offsetWidth } : null;
+
+      setPill((prev) =>
+        prev?.x === next?.x && prev?.width === next?.width ? prev : next,
+      );
+    };
+
+    measure();
+
+    const nav = navRef.current;
+    if (!nav || typeof ResizeObserver === 'undefined') return;
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(nav);
+    return () => observer.disconnect();
+  }, [activePath]);
 
   return (
-    <div className="min-h-screen bg-white text-slate-900 font-sans flex flex-col relative">
-      <header className="h-20 border-b border-slate-100 flex items-center justify-between px-6 lg:px-12 bg-white sticky top-0 z-50">
-          <Link to="/" className="flex items-center z-50">
-          <Building2 className="mr-2 h-8 w-8 text-[#315b42]" />
-          <h1 className="font-extrabold text-xl tracking-tight text-slate-900">PropManage</h1>
-        </Link>
-        <div className="hidden xl:flex items-center gap-1">
-          {navLinks.map((link) => (
-            <Link 
-              key={link.path}
-              to={link.path} 
-              className="relative px-3 py-2 text-sm font-medium text-slate-600 hover:text-slate-900 transition-colors"
+    <MotionConfig reducedMotion="user">
+      <div className="flex min-h-screen flex-col bg-[#FAF8F3] font-sans text-[#332D29]">
+        <header className="sticky top-0 z-50 px-3 pt-3 sm:px-6">
+          <div className="mx-auto flex h-[66px] max-w-7xl items-center justify-between gap-4 rounded-[20px] border border-white/70 bg-[#FAF8F3]/75 px-4 shadow-[0_4px_20px_rgba(51,45,41,0.045)] backdrop-blur-2xl sm:px-6">
+            <Link
+              to="/"
+              aria-label="PropManage home"
+              className="group flex shrink-0 items-center gap-2.5 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B]"
             >
-              {location.pathname === link.path && (
-                <motion.div
-                  layoutId="publicNavIndicator"
-                  className="absolute inset-0 -z-10 rounded-lg bg-[#edf0e9]"
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#332D29] text-[#E8DDCC] transition-transform duration-200 group-hover:scale-[1.04]">
+                <Building2 size={19} strokeWidth={1.8} />
+              </span>
+
+              <span className="text-[17px] font-bold tracking-[-0.045em] sm:text-lg">
+                PropManage<span className="text-[#B9A58B]">.</span>
+              </span>
+            </Link>
+
+            <nav
+              ref={navRef}
+              aria-label="Primary navigation"
+              className="relative hidden items-center gap-0.5 xl:flex"
+            >
+              {pill && (
+                <motion.span
+                  aria-hidden="true"
                   initial={false}
-                  transition={{ type: "spring", stiffness: 300, damping: 30 }}
+                  animate={{ x: pill.x, width: pill.width }}
+                  transition={{
+                    type: 'spring',
+                    stiffness: 380,
+                    damping: 32,
+                    mass: 0.8,
+                  }}
+                  className="pointer-events-none absolute left-0 top-0 h-full rounded-lg border border-[#E8DDCC]/80 bg-white/75 shadow-[0_1px_2px_rgba(51,45,41,0.04)]"
                 />
               )}
-              <span className="relative z-10">{link.name}</span>
-            </Link>
-          ))}
-        </div>
-        <div className="flex items-center gap-4 z-50">
-          <Link to="/login" className="hidden text-sm font-semibold text-[#315b42] hover:text-[#193b2f] xl:inline-flex">Log in</Link>
-          <Link to="/login" className="hidden items-center justify-center rounded-lg bg-[#24513d] px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#193b2f] sm:inline-flex">
-            Get Started
-          </Link>
-          <button 
-            className="xl:hidden p-2 text-slate-600 hover:bg-slate-100 rounded-md"
-            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-          >
-            {isMobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
-          </button>
-        </div>
-      </header>
 
-      {/* Mobile Menu Overlay */}
-      {isMobileMenuOpen && (
-        <div className="fixed inset-0 top-20 bg-white z-40 xl:hidden flex flex-col items-center justify-start pt-8 pb-6 px-6 gap-5 border-b border-slate-100 shadow-xl overflow-y-auto">
-          {navLinks.map((link) => <Link key={link.name} to={link.path} className="text-lg font-medium text-slate-900">{link.name}</Link>)}
-          <div className="w-full h-px bg-slate-100 my-2"></div>
-          <Link to="/login" className="text-lg font-semibold text-[#315b42]">Log in</Link>
-          <Link to="/login" className="mt-2 flex w-full justify-center rounded-lg bg-[#24513d] py-3 text-lg font-semibold text-white">
-            Get Started
-          </Link>
-        </div>
-      )}
+              {navLinks.map((link) => {
+                const active = linkIsActive(link.path);
 
-      <main className="flex-1 flex flex-col">
-        <Outlet />
-      </main>
-      <footer className="bg-slate-900 text-slate-300 px-6 py-9 lg:px-12">
-        <div className="mx-auto flex max-w-7xl flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
-          <Link to="/" className="flex items-center"><Building2 className="mr-2 h-6 w-6 text-[#d7b36a]" /><span className="text-lg font-bold text-white">PropManage</span></Link>
-          <nav aria-label="Footer navigation" className="flex flex-wrap gap-x-5 gap-y-2 text-sm">
-            <Link to="/pricing" className="hover:text-white">Pricing</Link>
-            <Link to="/contact" className="hover:text-white">Contact</Link>
-            <Link to="/privacy" className="hover:text-white">Privacy Policy</Link>
-          </nav>
-          <p className="text-sm text-slate-400">© 2026 PropManage. All rights reserved.</p>
-        </div>
-      </footer>
-    </div>
+                return (
+                  <Link
+                    key={link.path}
+                    ref={(el) => {
+                      linkRefs.current[link.path] = el;
+                    }}
+                    to={link.path}
+                    aria-current={active ? 'page' : undefined}
+                    className={[
+                      'relative z-10 rounded-lg px-3 py-2 text-[13px]',
+                      'transition-colors duration-200',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B]',
+                      active
+                        ? 'font-semibold text-[#332D29]'
+                        : 'font-medium text-[#756B61] hover:text-[#332D29]',
+                    ].join(' ')}
+                  >
+
+                    <span className="relative">{link.name}</span>
+                  </Link>
+                );
+              })}
+            </nav>
+
+            <div className="flex shrink-0 items-center gap-2">
+              <Link
+                to="/login"
+                className="hidden rounded-lg px-3 py-2 text-sm font-medium text-[#5E554D] transition-colors hover:text-[#332D29] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B] sm:inline-flex"
+              >
+                Log in
+              </Link>
+
+              <Link
+                to="/login"
+                className="group hidden min-h-10 items-center gap-2 rounded-xl bg-[#332D29] px-[18px] py-2 text-[13px] font-semibold text-[#FAF8F3] transition-[background-color,transform] duration-200 hover:-translate-y-px hover:bg-[#494039] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B] focus-visible:ring-offset-2 sm:inline-flex"
+              >
+                Get started
+                <ArrowUpRight
+                  size={15}
+                  className="transition-transform duration-200 group-hover:-translate-y-0.5 group-hover:translate-x-0.5"
+                />
+              </Link>
+
+              <button
+                type="button"
+                className="inline-flex h-10 w-10 items-center justify-center rounded-xl text-[#332D29] transition-colors hover:bg-white/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B] xl:hidden"
+                onClick={() => setIsMobileMenuOpen((open) => !open)}
+                aria-label={
+                  isMobileMenuOpen
+                    ? 'Close navigation menu'
+                    : 'Open navigation menu'
+                }
+                aria-expanded={isMobileMenuOpen}
+                aria-controls="mobile-navigation"
+              >
+                {isMobileMenuOpen ? (
+                  <X size={21} strokeWidth={1.8} />
+                ) : (
+                  <Menu size={21} strokeWidth={1.8} />
+                )}
+              </button>
+            </div>
+          </div>
+
+          <AnimatePresence>
+            {isMobileMenuOpen && (
+              <motion.nav
+                id="mobile-navigation"
+                aria-label="Mobile navigation"
+                initial={{ opacity: 0, y: -8, scale: 0.98 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: -8, scale: 0.98 }}
+                transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+                style={{ transformOrigin: 'top center' }}
+                className="absolute inset-x-3 top-[84px] z-50 mx-auto max-w-7xl rounded-2xl border border-[#E8DDCC] bg-[#FAF8F3]/95 p-3 shadow-[0_16px_40px_rgba(51,45,41,0.12)] backdrop-blur-2xl sm:inset-x-6 xl:hidden"
+              >
+                <div className="flex flex-col gap-1">
+                  {navLinks.map((link) => {
+                    const active = linkIsActive(link.path);
+
+                    return (
+                      <Link
+                        key={link.path}
+                        to={link.path}
+                        aria-current={active ? 'page' : undefined}
+                        className={[
+                          'flex min-h-11 items-center justify-between rounded-xl px-3.5 py-2.5 text-sm transition-colors',
+                          active
+                            ? 'bg-white font-semibold text-[#332D29]'
+                            : 'font-medium text-[#756B61] hover:bg-white/70 hover:text-[#332D29]',
+                        ].join(' ')}
+                      >
+                        {link.name}
+                        {active && (
+                          <span
+                            aria-hidden="true"
+                            className="h-1.5 w-1.5 rounded-full bg-[#397451]"
+                          />
+                        )}
+                      </Link>
+                    );
+                  })}
+
+                  <div className="my-1 border-t border-[#E8DDCC]" />
+
+                  <Link
+                    to="/login"
+                    className="flex min-h-11 items-center rounded-xl px-3.5 py-2.5 text-sm font-medium text-[#332D29] hover:bg-white/70"
+                  >
+                    Log in
+                  </Link>
+
+                  <Link
+                    to="/login"
+                    className="mt-1 flex min-h-11 items-center justify-center gap-2 rounded-xl bg-[#332D29] px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#494039]"
+                  >
+                    Get started
+                    <ArrowUpRight size={16} />
+                  </Link>
+                </div>
+              </motion.nav>
+            )}
+          </AnimatePresence>
+        </header>
+
+        <main className="flex flex-1 flex-col">
+          <Outlet />
+        </main>
+
+        <footer className="mt-auto bg-[#332D29] px-5 py-10 text-[#E8DDCC] sm:px-8 sm:py-12">
+          <div className="mx-auto max-w-7xl">
+            <div className="grid gap-8 border-b border-white/10 pb-8 sm:grid-cols-2 sm:items-start">
+              <div>
+                <Link
+                  to="/"
+                  className="inline-flex items-center gap-2.5 rounded-lg text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B]"
+                >
+                  <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/5">
+                    <Building2 size={19} className="text-[#B9A58B]" />
+                  </span>
+
+                  <span className="text-lg font-bold tracking-tight">
+                    PropManage<span className="text-[#B9A58B]">.</span>
+                  </span>
+                </Link>
+
+                <p className="mt-3 max-w-sm text-sm leading-6 text-[#E8DDCC]/70">
+                  A clearer workspace for the properties, people, and tasks
+                  that keep homes running.
+                </p>
+              </div>
+
+              <nav
+                aria-label="Footer navigation"
+                className="flex flex-wrap gap-x-6 gap-y-3 text-sm sm:justify-end"
+              >
+                <Link to="/pricing" className="transition-colors hover:text-white">
+                  Pricing
+                </Link>
+                <Link to="/contact" className="transition-colors hover:text-white">
+                  Contact
+                </Link>
+                <Link to="/privacy" className="transition-colors hover:text-white">
+                  Privacy Policy
+                </Link>
+              </nav>
+            </div>
+
+            <div className="flex flex-col gap-2 pt-5 text-xs text-[#B9A58B] sm:flex-row sm:items-center sm:justify-between">
+              <p>© {new Date().getFullYear()} PropManage. All rights reserved.</p>
+              <p>Property management, made clearer.</p>
+            </div>
+          </div>
+        </footer>
+      </div>
+    </MotionConfig>
   );
 }

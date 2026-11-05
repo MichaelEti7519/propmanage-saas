@@ -41,11 +41,11 @@ const REVENUE_DATA = [
 ];
 
 const EXPENSE_DATA = [
-  { name: 'Maintenance', value: 35000, color: '#f59e0b' },
-  { name: 'Property Tax', value: 45000, color: '#3b82f6' },
-  { name: 'Insurance', value: 15000, color: '#10b981' },
-  { name: 'Utilities', value: 25000, color: '#8b5cf6' },
-  { name: 'Management', value: 20000, color: '#6366f1' },
+  { name: 'Maintenance', value: 35000, color: '#95651D' },
+  { name: 'Property Tax', value: 45000, color: '#B9A58B' },
+  { name: 'Insurance', value: 15000, color: '#397451' },
+  { name: 'Utilities', value: 25000, color: '#756B61' },
+  { name: 'Management', value: 20000, color: '#332D29' },
 ];
 
 const PROPERTY_PERFORMANCE = [
@@ -154,16 +154,16 @@ export const LandlordAnalytics = () => {
             <div className="h-80 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={REVENUE_DATA} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                  <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} dy={10} />
-                  <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} tickFormatter={(val) => `$${val/1000}k`} />
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E8DDCC" />
+                  <XAxis dataKey="month" axisLine={false} tickLine={false} tick={{ fill: '#756B61', fontSize: 12 }} dy={10} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fill: '#756B61', fontSize: 12 }} tickFormatter={(val) => `$${val/1000}k`} />
                   <Tooltip 
-                    contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                    contentStyle={{ borderRadius: '12px', border: '1px solid #E8DDCC', boxShadow: '0 4px 20px rgba(51, 45, 41, 0.04)' }}
                     formatter={(value) => [`$${value.toLocaleString()}`, '']}
                   />
                   <Legend iconType="circle" wrapperStyle={{ paddingTop: '20px' }} />
-                  <Line type="monotone" name="Gross Revenue" dataKey="revenue" stroke="#6366f1" strokeWidth={3} dot={false} activeDot={{ r: 6 }} />
-                  <Line type="monotone" name="Net Income" dataKey="net" stroke="#10b981" strokeWidth={3} dot={false} activeDot={{ r: 6 }} />
+                  <Line type="monotone" name="Gross Revenue" dataKey="revenue" stroke="#332D29" strokeWidth={3} dot={false} activeDot={{ r: 6 }} />
+                  <Line type="monotone" name="Net Income" dataKey="net" stroke="#397451" strokeWidth={3} dot={false} activeDot={{ r: 6 }} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -211,16 +211,16 @@ export const LandlordAnalytics = () => {
           <div className="h-80 w-full">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={PROPERTY_PERFORMANCE} layout="vertical" margin={{ top: 5, right: 30, left: 40, bottom: 5 }}>
-                <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#e2e8f0" />
-                <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                <YAxis dataKey="name" type="category" axisLine={false} tickLine={false} tick={{ fill: '#475569', fontSize: 13, fontWeight: 500 }} />
+                <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#E8DDCC" />
+                <XAxis type="number" axisLine={false} tickLine={false} tick={{ fill: '#756B61', fontSize: 12 }} />
+                <YAxis dataKey="name" type="category" axisLine={false} tickLine={false} tick={{ fill: '#49413A', fontSize: 13, fontWeight: 500 }} />
                 <Tooltip 
-                  cursor={{ fill: '#f8fafc' }}
-                  contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                  cursor={{ fill: '#FAF8F3' }}
+                  contentStyle={{ borderRadius: '12px', border: '1px solid #E8DDCC', boxShadow: '0 4px 20px rgba(51, 45, 41, 0.04)' }}
                 />
                 <Legend iconType="circle" wrapperStyle={{ paddingTop: '20px' }} />
-                <Bar name="Occupancy Rate (%)" dataKey="occupancy" fill="#3b82f6" radius={[0, 4, 4, 0]} barSize={24} />
-                <Bar name="ROI (%)" dataKey="roi" fill="#8b5cf6" radius={[0, 4, 4, 0]} barSize={24} />
+                <Bar name="Occupancy Rate (%)" dataKey="occupancy" fill="#B9A58B" radius={[0, 4, 4, 0]} barSize={24} />
+                <Bar name="ROI (%)" dataKey="roi" fill="#332D29" radius={[0, 4, 4, 0]} barSize={24} />
               </BarChart>
             </ResponsiveContainer>
           </div>

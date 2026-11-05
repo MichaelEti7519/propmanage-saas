@@ -102,14 +102,14 @@ export function DashboardLayout({ children, navItems, userRole, userName, userEm
                 className={cn(
                   "relative w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors z-10",
                   isActive 
-                    ? "text-indigo-400" 
+                    ? "text-[#E8DDCC]"
                     : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/50"
                 )}
               >
                 {isActive && (
                   <motion.div
                     layoutId="activeNavIndicator"
-                    className="absolute inset-0 bg-indigo-600/10 rounded-lg -z-10"
+                    className="absolute inset-0 -z-10 rounded-lg bg-[#E8DDCC]/10"
                     initial={false}
                     transition={{ type: "spring", stiffness: 300, damping: 30 }}
                   />
@@ -125,7 +125,7 @@ export function DashboardLayout({ children, navItems, userRole, userName, userEm
         
         <div className="p-4 border-t border-slate-800">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-white font-medium text-sm flex-shrink-0">
+            <div className="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-[#332D29] font-medium text-sm flex-shrink-0">
               {userName.substring(0, 2).toUpperCase()}
             </div>
             <div className="overflow-hidden">

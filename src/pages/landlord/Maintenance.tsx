@@ -176,7 +176,7 @@ export const LandlordMaintenance = () => {
         {/* Metrics */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {metrics.map((metric) => (
-            <div key={idx} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
+            <div key={metric.label} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
               <div className={cn("w-12 h-12 rounded-xl flex items-center justify-center shrink-0", metric.bg, metric.color)}>
                 <metric.icon className="w-6 h-6" />
               </div>

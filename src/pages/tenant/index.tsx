@@ -233,7 +233,7 @@ export const TenantDashboard = () => {
                        name="Amount Paid"
                        type="monotone" 
                        dataKey="paid" 
-                       stroke="#6366f1" 
+                       stroke="#B9A58B"
                        strokeWidth={3}
                        dot={{ r: 4, strokeWidth: 2 }}
                        activeDot={{ r: 6, strokeWidth: 0 }}

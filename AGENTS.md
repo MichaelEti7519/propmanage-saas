@@ -3,6 +3,12 @@
 ## Project
 PropManage SaaS: React 19, TypeScript, Vite, Express, Prisma 7, and PostgreSQL. The product has public, landlord, tenant, and admin areas.
 
+## Visual Direction
+- Official palette: Ivory `#FAF8F3`, Sand `#E8DDCC`, Taupe `#B9A58B`, Espresso `#332D29`.
+- Use white surfaces, sand borders/selected states, espresso for primary text/actions, and taupe sparingly for accents. Keep success, warning, and danger colors distinct; avoid low-contrast taupe text on ivory.
+- Dashboard example figures are fictional and must be labeled illustrative. Keep the current PropManage app identity unless the user explicitly confirms a product-wide Haven rebrand.
+- Preserve existing behavior while styling: do not remove routes, forms, CRUD actions, modals, or stateful workflows to simplify the UI. Keep task/property/report actions working.
+
 ## Current Worktree
 There are 13 existing changed files to include in the next commit:
 

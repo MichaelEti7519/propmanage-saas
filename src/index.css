@@ -1,2 +1,65 @@
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600&family=Figtree:wght@400;500;600&display=swap');
 @import "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+	--font-display: 'Bricolage Grotesque', ui-sans-serif, system-ui, sans-serif;
+	--font-sans: 'Figtree', ui-sans-serif, system-ui, sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+:root {
+	--color-ivory: #FAF8F3;
+	--color-sand: #E8DDCC;
+	--color-taupe: #B9A58B;
+	--color-espresso: #332D29;
+	--color-surface: #FFFFFF;
+	--color-text-muted: #756B61;
+	--color-border: #E8DDCC;
+	--color-success: #397451;
+	--color-warning: #95651D;
+	--color-danger: #B44036;
+	--radius-card: 16px;
+	--radius-button: 10px;
+	--shadow-card: 0 4px 20px rgba(51, 45, 41, 0.04);
+}
+
+@theme inline {
+	--color-slate-50: var(--color-ivory);
+	--color-slate-100: #F2EEE6;
+	--color-slate-200: var(--color-border);
+	--color-slate-300: var(--color-taupe);
+	--color-slate-400: #8A7E72;
+	--color-slate-500: var(--color-text-muted);
+	--color-slate-600: #5E554D;
+	--color-slate-700: #49413A;
+	--color-slate-800: #3B342F;
+	--color-slate-900: var(--color-espresso);
+	--color-slate-950: #241F1C;
+
+	--color-indigo-50: #F5F0E8;
+	--color-indigo-100: #E8DDCC;
+	--color-indigo-200: #D8C8B3;
+	--color-indigo-300: #CBB89E;
+	--color-indigo-400: #D3C1A7;
+	--color-indigo-500: #B9A58B;
+	--color-indigo-600: #332D29;
+	--color-indigo-700: #332D29;
+	--color-indigo-800: #241F1C;
+	--color-indigo-900: #1A1715;
+}
+
+body {
+	margin: 0;
+	background: var(--color-ivory);
+	color: var(--color-espresso);
+}

@@ -153,7 +153,7 @@ export function ReportModal({
                     riskBand === level.value
                       ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
                       : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50',
-                  ].join(' ')}
+                  ].join('')}
                 >
                   {level.label}
                 </button>
@@ -213,5 +213,4 @@ export function ReportModal({
         </form>
       </div>
     </div>
-  );
-}
+  )};

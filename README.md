@@ -1,12 +1,28 @@
+
 # PropManage SaaS
 
-A landlord management SaaS built with React, Vite, Express, TypeScript, Prisma, and PostgreSQL.
+A premium, privacy-first landlord management SaaS built with React, Vite, Express, TypeScript, Prisma, and PostgreSQL.
+
+## Visual Direction & Palette
+
+PropManage uses a premium, consistent palette for all UI/UX:
+
+- **Ivory** `#FAF8F3` (backgrounds)
+- **Sand** `#E8DDCC` (borders, selected states)
+- **Taupe** `#B9A58B` (accents)
+- **Espresso** `#332D29` (primary text/actions)
+- **Accent** `#397451` (success, primary CTA)
+
+All screens (login, dashboard, properties, tenant profiles, rent collection, maintenance, settings, public, error, and legal pages) use this palette. No default Tailwind or off-brand colors remain. UI elements, forms, and cards are visually unified for a premium, modern experience.
+
+---
 
 This project is currently in active development. The frontend and route structure are already in place, and the backend is being moved from demo in-memory data toward a real persisted database layer.
 
+
 ## Current status
 
-Implemented:
+**Implemented:**
 - React + Vite frontend with landlord, tenant, and admin screens
 - JWT auth flow and protected routes
 - Property and unit management UI
@@ -14,12 +30,14 @@ Implemented:
 - Express API with rate limits and security middleware
 - Prisma schema for the core SaaS entities
 - Postgres-ready setup for the next deployment stage
+- All UI/UX on-brand with premium palette
 
-In progress:
-- full database-backed persistence for every route
+**In progress:**
+- Full database-backed persistence for every route
 - Stripe-based rent payment integration
-- production deployment config
-- final testing and cleanup
+- Production deployment config
+- Final testing and visual QA
+
 
 ## Tech stack
 
@@ -29,6 +47,7 @@ In progress:
 - Database: PostgreSQL + Prisma
 - Security: helmet, CORS, rate limiting
 - Email: Resend-ready for tenant invites
+
 
 ## Local setup
 
@@ -46,6 +65,7 @@ In progress:
    - `JWT_SECRET`
    - `ALLOWED_ORIGINS`
    - `DATABASE_URL`
+   - `DEV_SEED_PASSWORD` (local seed accounts only; use a unique password of at least 12 characters)
    - `APP_URL`
    - `RESEND_API_KEY` (optional)
    - `EMAIL_FROM` (optional)
@@ -61,6 +81,8 @@ In progress:
 
    npm run db:seed
 
+   The seed creates `admin@propmanage.saas`, `landlord@propmanage.saas`, and `tenant@propmanage.saas` as ordinary database accounts. All three use your locally configured `DEV_SEED_PASSWORD`; demo seeding is blocked in production.
+
 7. Start the app:
 
    npm run dev
@@ -72,12 +94,9 @@ In progress:
 ## Useful commands
 
 - Start dev app:
-
-  npm run dev
-
+   npm run dev
 - Type-check:
-
-  npm run lint
+   npm run lint
 
 - Generate Prisma client:
 

@@ -1,46 +1,60 @@
+import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
+import { PrismaPg } from '@prisma/adapter-pg';
 import bcrypt from 'bcryptjs';
 
-const prisma = new PrismaClient();
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  throw new Error('DATABASE_URL must be configured before seeding.');
+}
+
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: databaseUrl }) });
 
 async function main() {
-  const adminPassword = await bcrypt.hash('password', 10);
-  const landlordPassword = await bcrypt.hash('password', 10);
-  const tenantPassword = await bcrypt.hash('password', 10);
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('Demo accounts cannot be seeded in production.');
+  }
+
+  const seedPassword = process.env.DEV_SEED_PASSWORD;
+  if (!seedPassword || seedPassword.length < 12) {
+    throw new Error('Set DEV_SEED_PASSWORD to a local test password of at least 12 characters.');
+  }
+
+  const passwordHash = await bcrypt.hash(seedPassword, 10);
 
   const admin = await prisma.user.upsert({
     where: { email: 'admin@propmanage.saas' },
-    update: {},
+    update: { passwordHash },
     create: {
       firstName: 'Admin',
       lastName: 'User',
       email: 'admin@propmanage.saas',
       role: 'admin',
-      passwordHash: adminPassword,
+      passwordHash,
     },
   });
 
   const landlord = await prisma.user.upsert({
     where: { email: 'landlord@propmanage.saas' },
-    update: {},
+    update: { passwordHash },
     create: {
       firstName: 'Landlord',
       lastName: 'Manager',
       email: 'landlord@propmanage.saas',
       role: 'landlord',
-      passwordHash: landlordPassword,
+      passwordHash,
     },
   });
 
   const tenantUser = await prisma.user.upsert({
     where: { email: 'tenant@propmanage.saas' },
-    update: {},
+    update: { passwordHash },
     create: {
       firstName: 'Tenant',
       lastName: 'User',
       email: 'tenant@propmanage.saas',
       role: 'tenant',
-      passwordHash: tenantPassword,
+      passwordHash,
     },
   });
 
