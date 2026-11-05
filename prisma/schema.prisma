@@ -57,6 +57,13 @@ enum VerificationStatus {
   needs_review
 }
 
+enum ViewingRequestStatus {
+  pending
+  approved
+  declined
+  cancelled
+}
+
 model User {
   id            String            @id @default(cuid())
   firstName     String
@@ -77,6 +84,7 @@ model User {
   properties    Property[]        @relation("UserProperties")
   landlordTenants Tenant[]        @relation("LandlordTenants")
   accountTenants Tenant[]        @relation("AccountTenants")
+  viewingRequests ViewingRequest[]
   invitations   TenantInvitation[] @relation("InvitationLandlord")
   reportsFiled  Report[]          @relation("ReportReporter")
   reportsReviewed Report[]        @relation("ReportReviewer")
@@ -154,13 +162,31 @@ model Unit {
   bathrooms         Int
   rent              Int
   status            UnitStatus          @default(vacant)
+  isListed          Boolean             @default(false)
+  listingDescription String?
   tenantId          String?
   payments          Payment[]
   maintenanceRequests MaintenanceRequest[]
+  viewingRequests   ViewingRequest[]
   createdAt         DateTime            @default(now())
   updatedAt         DateTime            @updatedAt
 
   @@unique([propertyId, number])
+}
+
+model ViewingRequest {
+  id        String               @id @default(cuid())
+  tenantId  String
+  tenant    User                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  unitId    String
+  unit      Unit                 @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  status    ViewingRequestStatus @default(pending)
+  message   String?
+  createdAt DateTime             @default(now())
+  updatedAt DateTime             @updatedAt
+
+  @@index([tenantId, status, createdAt])
+  @@index([unitId, status, createdAt])
 }
 
 model Tenant {
