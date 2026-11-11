@@ -1,0 +1,22 @@
+import { Link } from 'react-router-dom';
+
+export function PrivacyPolicy() {
+  return (
+    <article className="mx-auto w-full max-w-4xl px-6 py-12 sm:py-16 bg-[#FAF8F3]">
+      <p className="text-sm font-semibold uppercase tracking-wider text-[#397451]">Privacy</p>
+      <h1 className="mt-2 text-3xl font-bold text-[#332D29] sm:text-4xl">Privacy Policy</h1>
+      <p className="mt-3 text-sm text-[#756B61]">Last updated: October 8, 2026</p>
+      <p className="mt-6 border-l-4 border-[#B9A58B] bg-[#E8DDCC] p-4 text-sm leading-6 text-[#332D29]">This notice describes the information PropManage processes in the current service. Contact us with privacy requests or questions using the details on our <Link to="/contact" className="font-semibold underline text-[#397451]">contact page</Link>.</p>
+      <div className="mt-9 space-y-8 text-sm leading-7 text-[#332D29]">
+        <section><h2 className="text-xl font-bold text-[#332D29]">Information we process</h2><p className="mt-2">Depending on how you use the service, this may include account and contact details, role and sign-in information, property and unit records, tenant and lease details, payment records, maintenance requests, messages, documents, invitations, and reports submitted for review. Do not submit full identity-document numbers or sensitive personal information unless the service specifically requests it.</p></section>
+        <section><h2 className="text-xl font-bold text-[#332D29]">Identity and property verification</h2><p className="mt-2">Verification statuses may be recorded separately from supporting documents. PropManage does not currently provide an upload flow for government IDs, deeds, bank statements, payslips, or other verification documents. Do not email or upload these materials. If a verified provider flow is introduced, we will explain what is collected, who verifies it, retention, and access before requesting consent.</p></section>
+        <section><h2 className="text-xl font-bold text-[#332D29]">How information is used</h2><p className="mt-2">We use information to create and secure accounts, provide property-management workflows, route tenant invitations, display records to the appropriate account roles, respond to support requests, investigate reports, prevent misuse, and comply with applicable obligations.</p></section>
+        <section><h2 className="text-xl font-bold text-[#332D29]">Who may receive information</h2><p className="mt-2">Information is available to the account holder and authorized people involved in the related rental workflow. We may use infrastructure and service providers needed to operate the product. We do not claim that payment processing, tenant screening, or third-party integrations are active unless they are configured and disclosed for your account.</p></section>
+        <section><h2 className="text-xl font-bold text-[#332D29]">Security and retention</h2><p className="mt-2">We use access controls and technical safeguards intended to protect account information. No internet service can guarantee absolute security. Information is retained while needed to provide the service, address disputes, meet legal requirements, or protect the platform, then deleted or de-identified where practical.</p></section>
+        <section><h2 className="text-xl font-bold text-[#332D29]">Your choices and requests</h2><p className="mt-2">You can request access, correction, or deletion of personal information, subject to legal and operational requirements. Some information may need to remain available for active leases, disputes, security, or compliance. Contact us through the <Link to="/contact" className="font-semibold text-[#397451] underline">contact form</Link> to make a request.</p></section>
+        <section><h2 className="text-xl font-bold text-[#332D29]">Legal requests and disputes</h2><p className="mt-2">We do not disclose a person&apos;s hidden identity or private verification data directly to another user. Where disclosure is legally required or authorized, requests are reviewed and information is provided to the appropriate law-enforcement authority or court through lawful process, with access limited to what is required.</p></section>
+        <section><h2 className="text-xl font-bold text-[#332D29]">Changes and questions</h2><p className="mt-2">We may update this notice as the service changes. The updated date above indicates the latest revision. Privacy rules differ by location; this page does not replace jurisdiction-specific legal advice.</p></section>
+      </div>
+    </article>
+  );
+}
