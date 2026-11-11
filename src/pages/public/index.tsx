@@ -5,6 +5,7 @@ import { motion } from 'motion/react';
 import PhoneInput from 'react-phone-number-input';
 import 'react-phone-number-input/style.css';
 import { useAuth } from '../../hooks/useAuth';
+import { AnimatedContent } from '../../components/AnimatedContent';
 
 type RegisterRole = 'landlord' | 'tenant';
 
@@ -169,22 +170,24 @@ const propertyPhotos = [
 
 function PropertyHeroImage() {
   return (
-    <figure className="relative min-h-[340px] overflow-hidden rounded-md bg-[#E8DDCC] sm:min-h-[480px] lg:min-h-[570px]">
-      <img
-        src={propertyPhotos[0].src}
-        alt={propertyPhotos[0].alt}
-        className="absolute inset-0 h-full w-full object-cover"
-        fetchPriority="high"
-      />
-      <div className="absolute left-4 top-4 bg-white/95 px-4 py-2.5 text-xs font-semibold text-[#332D29] sm:left-6 sm:top-6">
-        <MapPin className="mr-2 inline h-3.5 w-3.5 text-[#397451]" />
-        Illustrative rental property
-      </div>
-      <figcaption className="absolute inset-x-0 bottom-0 flex items-center justify-between bg-[#332D29] px-4 py-3 text-xs text-white sm:px-6">
-        <span>Residential property</span>
-        <span className="text-[#E8DDCC]">{propertyPhotos[0].location}</span>
-      </figcaption>
-    </figure>
+    <AnimatedContent className="relative" trigger="mount" distance={12} duration={0.45}>
+      <figure className="relative min-h-[340px] overflow-hidden rounded-md bg-[#E8DDCC] sm:min-h-[480px] lg:min-h-[570px]">
+        <img
+          src={propertyPhotos[0].src}
+          alt={propertyPhotos[0].alt}
+          className="absolute inset-0 h-full w-full object-cover"
+          fetchPriority="high"
+        />
+        <div className="absolute left-4 top-4 bg-white/95 px-4 py-2.5 text-xs font-semibold text-[#332D29] sm:left-6 sm:top-6">
+          <MapPin className="mr-2 inline h-3.5 w-3.5 text-[#397451]" />
+          Illustrative rental property
+        </div>
+        <figcaption className="absolute inset-x-0 bottom-0 flex items-center justify-between bg-[#332D29] px-4 py-3 text-xs text-white sm:px-6">
+          <span>Residential property</span>
+          <span className="text-[#E8DDCC]">{propertyPhotos[0].location}</span>
+        </figcaption>
+      </figure>
+    </AnimatedContent>
   );
 }
 
@@ -295,21 +298,23 @@ export function Landing() {
 
           <div className="grid grid-cols-2 items-start gap-4 sm:gap-7">
             {propertyPhotos.slice(1).map((photo, index) => (
-              <figure key={photo.label} className={index === 1 ? 'mt-10 sm:mt-16' : ''}>
-                <div className="overflow-hidden rounded-md bg-[#E8DDCC]">
-                  <img
-                    src={photo.src}
-                    alt={photo.alt}
-                    loading="lazy"
-                    className="aspect-[0.82] w-full object-cover transition-transform duration-500 hover:scale-[1.02]"
-                  />
-                </div>
-                <figcaption className="mt-3 border-t border-[#B9A58B] pt-3">
-                  <span className="mr-2 text-[10px] font-semibold text-[#397451]">{photo.label}</span>
-                  <span className="text-xs font-semibold text-[#332D29]">{photo.title}</span>
-                  <span className="mt-1 block text-[10px] text-[#756B61]">{photo.location}</span>
-                </figcaption>
-              </figure>
+              <AnimatedContent key={photo.label} className={index === 1 ? 'mt-10 sm:mt-16' : ''} delay={index * 0.08} distance={12} duration={0.42}>
+                <figure>
+                  <div className="overflow-hidden rounded-md bg-[#E8DDCC]">
+                    <img
+                      src={photo.src}
+                      alt={photo.alt}
+                      loading="lazy"
+                      className="aspect-[0.82] w-full object-cover transition-transform duration-500 hover:scale-[1.02]"
+                    />
+                  </div>
+                  <figcaption className="mt-3 border-t border-[#B9A58B] pt-3">
+                    <span className="mr-2 text-[10px] font-semibold text-[#397451]">{photo.label}</span>
+                    <span className="text-xs font-semibold text-[#332D29]">{photo.title}</span>
+                    <span className="mt-1 block text-[10px] text-[#756B61]">{photo.location}</span>
+                  </figcaption>
+                </figure>
+              </AnimatedContent>
             ))}
           </div>
         </div>

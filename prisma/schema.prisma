@@ -85,6 +85,7 @@ model User {
   landlordTenants Tenant[]        @relation("LandlordTenants")
   accountTenants Tenant[]        @relation("AccountTenants")
   viewingRequests ViewingRequest[]
+  documents     Document[]
   invitations   TenantInvitation[] @relation("InvitationLandlord")
   reportsFiled  Report[]          @relation("ReportReporter")
   reportsReviewed Report[]        @relation("ReportReviewer")
@@ -272,11 +273,15 @@ model Message {
 
 model Document {
   id        String   @id @default(cuid())
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   name      String
   type      String
   date      DateTime
   size      String
-  tags      String[]
+  tags      String[] @default([])
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([ownerId, createdAt])
 }

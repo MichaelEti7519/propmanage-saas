@@ -1,26 +1,28 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { FileText, Search, Filter, Download, Eye, Calendar, FileDigit, Upload, Sparkles, Loader2 } from 'lucide-react';
+import { FileText, Search, Filter, Calendar, FileDigit, Upload, Sparkles, Loader2, ShieldCheck } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useAuth } from '../../hooks/useAuth';
+import GlideSelect, { type GlideSelectOption } from '../../components/GlideSelect';
 
 type DocumentRecord = { id: string; name: string; type: string; date: string; size: string; tags?: string[]; ownerId?: string; url?: string };
 
-const INITIAL_DOCUMENTS: DocumentRecord[] = [
-  { id: '1', name: 'Lease_Agreement_2026-2027.pdf', type: 'Lease', date: '2026-01-15', size: '2.4 MB', tags: ['2026-02-01', '2027-01-31'] },
-  { id: '2', name: 'Rent_Receipt_June_2026.pdf', type: 'Receipt', date: '2026-06-01', size: '120 KB', tags: [] },
-  { id: '3', name: 'Maintenance_Notice_Water.pdf', type: 'Notice', date: '2026-05-20', size: '45 KB', tags: ['2026-05-22'] },
-  { id: '4', name: 'Rent_Receipt_May_2026.pdf', type: 'Receipt', date: '2026-05-01', size: '118 KB', tags: [] },
-  { id: '5', name: 'Move_In_Checklist.pdf', type: 'Other', date: '2026-01-15', size: '850 KB', tags: [] },
-  { id: '6', name: 'Welcome_Letter.pdf', type: 'Notice', date: '2026-01-10', size: '1.1 MB', tags: [] },
+const MAX_FILE_SIZE = 8 * 1024 * 1024;
+const documentTypeOptions: GlideSelectOption[] = [
+  { value: 'Lease', label: 'Lease', tag: 'Agreement' },
+  { value: 'Receipt', label: 'Receipt', tag: 'Payment' },
+  { value: 'Notice', label: 'Notice', tag: 'Property' },
 ];
 
 export const TenantDocuments = () => {
   const { fetchWithAuth } = useAuth();
-  const [documents, setDocuments] = useState<DocumentRecord[]>(INITIAL_DOCUMENTS);
+  const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterType, setFilterType] = useState('All');
   const [sortBy, setSortBy] = useState('newest');
-
+  const [selectedType, setSelectedType] = useState('');
+  const [privacyConfirmed, setPrivacyConfirmed] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -32,10 +34,11 @@ export const TenantDocuments = () => {
         if (!response.ok || !result.success) {
           throw new Error(result.error || 'Could not load your documents.');
         }
-        setDocuments(result.data && result.data.length > 0 ? result.data : INITIAL_DOCUMENTS);
+        setDocuments(result.data ?? []);
       } catch (error) {
         console.error(error);
-        setDocuments(INITIAL_DOCUMENTS);
+        setDocuments([]);
+        setLoadError(error instanceof Error ? error.message : 'Could not load your documents.');
       }
     };
 
@@ -87,61 +90,87 @@ export const TenantDocuments = () => {
     const file = event.target.files?.[0];
     if (!file) return;
 
+    setUploadError(null);
+    if (!selectedType) {
+      setUploadError('Choose a document type before selecting a file.');
+      event.target.value = '';
+      return;
+    }
+    if (!privacyConfirmed) {
+      setUploadError('Confirm the document privacy notice before uploading.');
+      event.target.value = '';
+      return;
+    }
+    if (file.size === 0 || file.size > MAX_FILE_SIZE) {
+      setUploadError('Choose a non-empty PDF, JPEG, or PNG file no larger than 8 MB.');
+      event.target.value = '';
+      return;
+    }
+
+    const extension = file.name.split('.').pop()?.toLowerCase();
+    const expectedMime = extension === 'pdf'
+      ? 'application/pdf'
+      : extension === 'jpg' || extension === 'jpeg'
+        ? 'image/jpeg'
+        : extension === 'png'
+          ? 'image/png'
+          : undefined;
+    if (!expectedMime || (file.type && file.type !== expectedMime)) {
+      setUploadError('Only PDF, JPEG, and PNG documents are accepted.');
+      event.target.value = '';
+      return;
+    }
+
     setIsUploading(true);
-
     try {
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const base64Data = e.target?.result as string;
-        
-        try {
-          const response = await fetchWithAuth('/api/scan-document', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              fileName: file.name,
-              mimeType: file.type,
-              base64Data
-            })
-          });
+      const base64Data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => typeof reader.result === 'string'
+          ? resolve(reader.result)
+          : reject(new Error('Could not read the selected file.'));
+        reader.onerror = () => reject(new Error('Could not read the selected file.'));
+        reader.readAsDataURL(file);
+      });
 
-          const result = await response.json() as { success?: boolean; data?: { type?: string; primaryDate?: string; extractedDates?: string[] }; error?: string };
-          if (result.success && result.data) {
-            const persistedResponse = await fetchWithAuth('/api/documents', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                name: file.name,
-                type: result.data.type || 'Other',
-                date: result.data.primaryDate || new Date().toISOString().split('T')[0],
-                size: formatSize(file.size),
-                tags: result.data.extractedDates || [],
-              }),
-            });
-
-            const persisted = await persistedResponse.json() as { success?: boolean; data?: DocumentRecord; error?: string };
-            if (!persistedResponse.ok || !persisted.success || !persisted.data) {
-              throw new Error(persisted.error || 'Could not save the uploaded document.');
-            }
-
-            setDocuments(prev => [persisted.data!, ...prev.filter((doc) => doc.id !== persisted.data!.id)]);
-          } else {
-            console.error("Scanning failed:", result.error);
-            alert("Failed to analyze document: " + (result.error || "Unknown error"));
-          }
-        } catch (error) {
-          console.error("API Error:", error);
-          alert(error instanceof Error ? error.message : "Network error. Could not process document.");
-        } finally {
-          setIsUploading(false);
-          // reset input
-          if (fileInputRef.current) fileInputRef.current.value = '';
-        }
+      const response = await fetchWithAuth('/api/scan-document', {
+        method: 'POST',
+        body: JSON.stringify({
+          fileName: file.name,
+          documentType: selectedType,
+          mimeType: expectedMime,
+          base64Data,
+        }),
+      });
+      const result = await response.json() as {
+        success?: boolean;
+        data?: { primaryDate?: string; extractedDates?: string[] };
+        error?: string;
       };
-      reader.readAsDataURL(file);
+      if (!response.ok || !result.success || !result.data) {
+        throw new Error(result.error || 'Could not analyze the selected document.');
+      }
+
+      const persistedResponse = await fetchWithAuth('/api/documents', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: file.name,
+          type: selectedType,
+          date: result.data.primaryDate || new Date().toISOString().split('T')[0],
+          size: formatSize(file.size),
+          tags: result.data.extractedDates || [],
+        }),
+      });
+      const persisted = await persistedResponse.json() as { success?: boolean; data?: DocumentRecord; error?: string };
+      if (!persistedResponse.ok || !persisted.success || !persisted.data) {
+        throw new Error(persisted.error || 'Could not save document details.');
+      }
+
+      setDocuments((current) => [persisted.data!, ...current]);
     } catch (error) {
-      console.error("File processing error", error);
+      setUploadError(error instanceof Error ? error.message : 'Could not process the selected document.');
+    } finally {
       setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
@@ -169,26 +198,58 @@ export const TenantDocuments = () => {
 
       <div className="max-w-6xl mx-auto space-y-6 sm:space-y-8">
         
-        <div className="flex flex-col sm:flex-row justify-between sm:items-end gap-4">
+        <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">Leases & Documents</h1>
-            <p className="text-slate-500 mt-1">View, download, and manage your rental documents securely.</p>
+            <p className="text-slate-500 mt-1">Keep document details organized without storing original files in PropManage.</p>
           </div>
-          <button 
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center justify-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-medium shadow-sm transition-colors"
-          >
-            <Upload className="w-4 h-4" />
-            Upload Document
-          </button>
-          <input 
-            type="file" 
-            ref={fileInputRef} 
-            className="hidden" 
-            accept="image/*,.pdf" 
-            onChange={handleFileUpload} 
-          />
+          <div className="grid w-full gap-3 sm:grid-cols-[minmax(220px,1fr)_auto] lg:max-w-2xl">
+            <div>
+              <label className="mb-1.5 block text-xs font-semibold text-slate-700">Choose document type first</label>
+              <GlideSelect
+                options={documentTypeOptions}
+                value={selectedType}
+                onChange={setSelectedType}
+                placeholder="Select category"
+                ariaLabel="Document category"
+              />
+            </div>
+            <div className="flex items-end">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={!selectedType || !privacyConfirmed || isUploading}
+                className="flex min-h-11 w-full items-center justify-center gap-2 bg-[#332D29] px-5 text-sm font-semibold text-white transition-colors hover:bg-[#397451] disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
+              >
+                <Upload className="h-4 w-4" />
+                Select file
+              </button>
+              <input
+                type="file"
+                ref={fileInputRef}
+                className="hidden"
+                accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+                disabled={!selectedType || !privacyConfirmed || isUploading}
+                onChange={handleFileUpload}
+              />
+            </div>
+          </div>
         </div>
+
+        <div className="max-w-4xl border-l-2 border-[#B9A58B] bg-white px-4 py-3 text-sm text-slate-700">
+          <div className="flex items-start gap-2">
+            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[#397451]" />
+            <p className="leading-6">PDF, JPEG, or PNG only, up to 8 MB. The file is sent to Google Gemini for date extraction and is not stored by PropManage; only document metadata is saved. Never upload IDs, deeds, bank statements, payslips, or files containing sensitive identity or financial details.</p>
+          </div>
+          <label className="mt-3 flex cursor-pointer items-start gap-2 border-t border-slate-100 pt-3 text-xs leading-5 text-slate-600">
+            <input type="checkbox" checked={privacyConfirmed} onChange={(event) => setPrivacyConfirmed(event.target.checked)} className="mt-1 h-4 w-4 shrink-0 accent-[#397451]" />
+            <span>I understand the file is sent to Google Gemini for analysis and confirm it does not contain prohibited identity or financial documents.</span>
+          </label>
+        </div>
+
+        {(uploadError || loadError) && (
+          <p role="alert" className="max-w-4xl border-l-2 border-red-500 bg-white px-4 py-3 text-sm text-red-700">{uploadError || loadError}</p>
+        )}
 
         {/* Search and Filter Bar */}
         <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row gap-4">
@@ -272,14 +333,6 @@ export const TenantDocuments = () => {
                     </div>
                   </div>
                   
-                  <div className="flex items-center gap-2 self-end sm:self-auto">
-                    <button className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors" title="View Document">
-                      <Eye className="w-5 h-5" />
-                    </button>
-                    <button className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors" title="Download">
-                      <Download className="w-5 h-5" />
-                    </button>
-                  </div>
                 </div>
               ))}
             </div>

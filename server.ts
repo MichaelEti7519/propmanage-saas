@@ -64,7 +64,11 @@ interface AuthRequest extends express.Request {
   };
 }
 
-const JWT_SECRET = process.env.JWT_SECRET || 'propmanage_dev_secret';
+const JWT_SECRET = process.env.JWT_SECRET ?? '';
+if (!JWT_SECRET || Buffer.byteLength(JWT_SECRET, 'utf8') < 32) {
+  throw new Error('JWT_SECRET must be set to at least 32 characters before the server can start.');
+}
+const BCRYPT_ROUNDS = 12;
 const JWT_EXPIRY = '2h';
 const DEFAULT_ALLOWED_ORIGINS = ['http://localhost:3000'];
 
@@ -75,12 +79,7 @@ function isValidEmail(email: string) {
 }
 
 function isStrongPassword(password: string) {
-  return typeof password === 'string' && password.length >= 8;
-}
-
-function isVeryStrongPassword(password: string) {
-  // At least 12 chars, one upper, one lower, one digit, one special
-  return typeof password === 'string' && /(?=.{12,})(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9])/.test(password);
+  return typeof password === 'string' && password.length >= 12 && Buffer.byteLength(password, 'utf8') <= 72;
 }
 
 function sanitizeString(value: unknown) {
@@ -127,6 +126,8 @@ function mapDbUnit(unit: any): Unit {
     rent: unit.rent ?? 0,
     status: unit.status ?? 'vacant',
     tenantId: unit.tenantId ?? undefined,
+    isListed: unit.isListed ?? false,
+    listingDescription: unit.listingDescription ?? undefined,
   };
 }
 
@@ -147,41 +148,9 @@ function mapDbTenant(tenant: any): Tenant {
   };
 }
 
-const users: User[] = [
-  {
-    id: 'u-admin',
-    firstName: 'Admin',
-    lastName: 'User',
-    email: 'admin@propmanage.saas',
-    role: 'admin',
-    passwordHash: bcrypt.hashSync('password', 10),
-  },
-  {
-    id: 'u-landlord',
-    firstName: 'Landlord',
-    lastName: 'Manager',
-    email: 'landlord@propmanage.saas',
-    role: 'landlord',
-    passwordHash: bcrypt.hashSync('password', 10),
-  },
-  {
-    id: 'u-tenant',
-    firstName: 'Tenant',
-    lastName: 'User',
-    email: 'tenant@propmanage.saas',
-    role: 'tenant',
-    passwordHash: bcrypt.hashSync('password', 10),
-  },
-];
-
 // Token revocation and login protections (in-memory)
 const tokenBlacklist = new Set<string>();
 const revokedBefore: Record<string, number> = {};
-const loginAttempts: Record<string, { count: number; firstFailedAt: number }> = {};
-const MAX_LOGIN_ATTEMPTS = 5;
-const LOCK_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
-
-
 function createAuthToken(user: User) {
   const jti = randomUUID();
   return jwt.sign(
@@ -268,6 +237,8 @@ interface Unit {
   rent: number;
   status: string;
   tenantId?: string;
+  isListed?: boolean;
+  listingDescription?: string;
 }
 
 interface Tenant {
@@ -291,20 +262,6 @@ function canAccessTenant(user: AuthRequest['user'], tenant: Tenant) {
   const unit = units.find((item) => item.id === tenant.unitId);
   const property = unit && properties.find((item) => item.id === unit.propertyId);
   return user?.role === 'landlord' && (tenant.landlordId === user.sub || property?.landlordId === user.sub);
-}
-
-interface TenantInvitation {
-  tokenHash: string;
-  landlordId: string;
-  email: string;
-  firstName: string;
-  lastName: string;
-  phone?: string;
-  unitId: string;
-  leaseStart?: string;
-  leaseEnd?: string;
-  expiresAt: number;
-  accepted: boolean;
 }
 
 interface Payment {
@@ -394,7 +351,6 @@ const tenants: Tenant[] = [
   { id: 't3', firstName: 'Michael', lastName: 'Johnson', email: 'mjohnson@example.com', phone: '(555) 555-5555', unitId: 'u1', status: 'Active', leaseStart: '2024-07-01', leaseEnd: '2025-06-30', rent: 1800 },
 ];
 
-const tenantInvitations: TenantInvitation[] = [];
 
 const payments: Payment[] = [
   { id: 'pay1', tenantId: 't1', unitId: 'u3', amount: 2400, dueDate: '2026-06-01', paidDate: '2026-06-01', status: 'paid', method: 'Credit Card' },
@@ -461,8 +417,8 @@ async function startServer() {
     credentials: true,
   }));
 
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ limit: '32kb', extended: true }));
 
   const apiLimiter = rateLimit({
     windowMs: 60 * 1000,
@@ -474,10 +430,19 @@ async function startServer() {
 
   const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 10,
+    max: 5,
     standardHeaders: true,
     legacyHeaders: false,
+    skipSuccessfulRequests: true,
     message: { success: false, error: 'Too many login attempts, please try again later.' },
+  });
+
+  const registerLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, error: 'Too many registration attempts. Please try again later.' },
   });
 
   const inviteCreateLimiter = rateLimit({
@@ -499,7 +464,7 @@ async function startServer() {
   app.use('/api', apiLimiter);
   app.use('/api/auth', authLimiter);
 
-  const publicApiPaths = ['/api/health', '/api/auth/login', '/api/auth/register', '/api/contact'];
+  const publicApiPaths = ['/api/health', '/api/auth/login', '/api/auth/register', '/api/contact', '/api/listings'];
   const publicInvitationPath = /^\/api\/tenant-invitations\/[a-f0-9]{64}(?:\/accept)?$/;
   app.use((req, res, next) => {
     if (req.path.startsWith('/api') && !publicApiPaths.includes(req.path) && !publicInvitationPath.test(req.path)) {
@@ -761,7 +726,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/auth/register', async (req, res) => {
+  app.post('/api/auth/register', registerLimiter, async (req, res) => {
     const firstName = sanitizeString(req.body.firstName);
     const lastName = sanitizeString(req.body.lastName);
     const email = sanitizeString(req.body.email).toLowerCase();
@@ -776,12 +741,12 @@ async function startServer() {
       return res.status(400).json({ success: false, error: 'Please provide a valid email address.' });
     }
     if (!isStrongPassword(password)) {
-      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters long.' });
+      return res.status(400).json({ success: false, error: 'Password must be 12-72 UTF-8 bytes long.' });
     }
     if (!ALLOWED_REGISTRATION_ROLES.includes(role)) {
       return res.status(403).json({ success: false, error: 'Registration is not allowed for this role.' });
     }
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     try {
       const dbUser = await prisma.user.create({
         data: {
@@ -804,7 +769,6 @@ async function startServer() {
         },
       });
       const newUser: User = { ...dbUser, phone: dbUser.phone ?? undefined };
-      users.push(newUser);
       const token = createAuthToken(newUser);
       return res.status(201).json({
         success: true,
@@ -844,12 +808,6 @@ async function startServer() {
       return res.status(400).json({ success: false, error: 'Please provide a valid email address.' });
     }
 
-    // Lockout check
-    const attempt = loginAttempts[email];
-    if (attempt && attempt.count >= MAX_LOGIN_ATTEMPTS && Date.now() - attempt.firstFailedAt < LOCK_WINDOW_MS) {
-      return res.status(429).json({ success: false, error: 'Too many failed login attempts. Please try again later.' });
-    }
-
     let user: User | null;
     try {
       const dbUser = await prisma.user.findUnique({ where: { email } });
@@ -859,21 +817,13 @@ async function startServer() {
       return res.status(503).json({ success: false, error: 'Account service is temporarily unavailable. Please try again shortly.' });
     }
     if (!user) {
-      // increment failed attempts
-      if (!loginAttempts[email]) loginAttempts[email] = { count: 1, firstFailedAt: Date.now() };
-      else loginAttempts[email].count += 1;
       return res.status(401).json({ success: false, error: 'Invalid email or password.' });
     }
 
     const passwordValid = await bcrypt.compare(password, user.passwordHash);
     if (!passwordValid) {
-      if (!loginAttempts[email]) loginAttempts[email] = { count: 1, firstFailedAt: Date.now() };
-      else loginAttempts[email].count += 1;
       return res.status(401).json({ success: false, error: 'Invalid email or password.' });
     }
-
-    // successful login - reset attempts
-    if (loginAttempts[email]) delete loginAttempts[email];
 
     const token = createAuthToken(user);
     res.json({ success: true, user: { id: user.id, firstName: user.firstName, lastName: user.lastName, email: user.email, role: user.role }, token });
@@ -894,22 +844,30 @@ async function startServer() {
     return res.json({ success: true, message: 'All sessions for this user have been invalidated.' });
   });
 
-  // Admin emergency password rotation (requires ADMIN_ROTATE_SECRET header)
-  app.post('/api/auth/rotate-admin-password', async (req, res) => {
-    const adminSecret = req.header('x-admin-secret');
-    if (!process.env.ADMIN_ROTATE_SECRET || adminSecret !== process.env.ADMIN_ROTATE_SECRET) {
-      return res.status(403).json({ success: false, error: 'Forbidden. ADMIN_ROTATE_SECRET is required.' });
+  app.post('/api/auth/rotate-admin-password', requireRole('admin'), async (req, res) => {
+    const authUser = (req as AuthRequest).user!;
+    const currentPassword = sanitizeString(req.body?.currentPassword);
+    const newPassword = sanitizeString(req.body?.newPassword);
+    if (!currentPassword || !isStrongPassword(newPassword) || currentPassword === newPassword) {
+      return res.status(400).json({ success: false, error: 'Enter your current password and a different 12-72 byte new password.' });
     }
-    const { newPassword } = req.body;
-    if (!newPassword || !isVeryStrongPassword(newPassword)) {
-      return res.status(400).json({ success: false, error: 'New password must be at least 12 chars and include upper/lower/number/special.' });
+
+    try {
+      const adminUser = await prisma.user.findUnique({ where: { id: authUser.sub } });
+      if (!adminUser || adminUser.role !== 'admin' || !(await bcrypt.compare(currentPassword, adminUser.passwordHash))) {
+        return res.status(403).json({ success: false, error: 'Current password is incorrect.' });
+      }
+
+      await prisma.user.update({
+        where: { id: adminUser.id },
+        data: { passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) },
+      });
+      revokedBefore[adminUser.id] = Date.now();
+      return res.json({ success: true, message: 'Password updated. Sign in again with the new password.' });
+    } catch (error) {
+      console.error('Unable to rotate admin password:', error);
+      return res.status(503).json({ success: false, error: 'Password service is temporarily unavailable.' });
     }
-    const adminUser = users.find((u) => u.role === 'admin');
-    if (!adminUser) return res.status(404).json({ success: false, error: 'Admin user not found.' });
-    adminUser.passwordHash = await bcrypt.hash(newPassword, 12);
-    // revoke all admin tokens
-    revokedBefore[adminUser.id] = Date.now();
-    return res.json({ success: true, message: 'Admin password rotated and active sessions revoked. Please sign in with the new password.' });
   });
 
   app.get('/api/auth/me', (req, res) => {
@@ -1033,71 +991,7 @@ async function startServer() {
     if (dbInvite && dbInvite.type === 'success') {
       return res.status(dbInvite.status).json({ success: true, data: dbInvite.data });
     }
-
-    if (users.some((user) => user.email === email)) {
-      return res.status(409).json({ success: false, error: 'An account already exists for this email address.' });
-    }
-    if (tenantInvitations.some((invite) => invite.email === email && !invite.accepted && invite.expiresAt > Date.now())) {
-      return res.status(409).json({ success: false, error: 'An active invitation already exists for this email address.' });
-    }
-
-    const unit = units.find((item) => item.id === unitId);
-    const property = unit && properties.find((item) => item.id === unit.propertyId);
-    if (!unit || !property || property.landlordId !== authReq.user?.sub) {
-      return res.status(404).json({ success: false, error: 'Unit not found in your properties.' });
-    }
-    if (unit.status.toLowerCase() !== 'vacant' || unit.tenantId) {
-      return res.status(409).json({ success: false, error: 'Choose a vacant unit with no tenant assigned.' });
-    }
-    if (tenantInvitations.some((invite) => invite.unitId === unitId && !invite.accepted && invite.expiresAt > Date.now())) {
-      return res.status(409).json({ success: false, error: 'This unit already has an active invitation.' });
-    }
-
-    const token = randomBytes(32).toString('hex');
-    const tokenHash = createHash('sha256').update(token).digest('hex');
-    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
-    tenantInvitations.push({
-      tokenHash,
-      landlordId: authReq.user!.sub,
-      email,
-      firstName,
-      lastName,
-      phone,
-      unitId,
-      leaseStart,
-      leaseEnd,
-      expiresAt,
-      accepted: false,
-    });
-
-    const appUrl = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
-    const inviteUrl = `${appUrl}/invite/${token}`;
-    let emailSent = false;
-    if (process.env.RESEND_API_KEY) {
-      try {
-        const emailResponse = await fetch('https://api.resend.com/emails', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            from: process.env.EMAIL_FROM || 'PropManage <onboarding@resend.dev>',
-            to: [email],
-            subject: 'You are invited to your tenant portal',
-            html: `<p>You have been invited to join your tenant portal.</p><p><a href="${inviteUrl}">Review invitation</a></p><p>This link expires in 7 days.</p>`,
-          }),
-        });
-        emailSent = emailResponse.ok;
-      } catch {
-        emailSent = false;
-      }
-    }
-
-    res.status(201).json({
-      success: true,
-      data: { email, emailSent, inviteUrl, expiresAt },
-    });
+    return res.status(503).json({ success: false, error: 'Invitation service is temporarily unavailable.' });
   });
 
   app.get('/api/tenant-invitations/:token', async (req, res) => {
@@ -1137,29 +1031,7 @@ async function startServer() {
       }
       return res.json(dbInvite);
     }
-
-    const invite = tenantInvitations.find((item) => item.tokenHash === tokenHash);
-    if (!invite || invite.accepted || invite.expiresAt <= Date.now()) {
-      return res.status(404).json({ success: false, error: 'This invitation is invalid or has expired.' });
-    }
-
-    const unit = units.find((item) => item.id === invite.unitId);
-    const property = unit && properties.find((item) => item.id === unit.propertyId);
-    if (!unit || !property || property.landlordId !== invite.landlordId) {
-      return res.status(404).json({ success: false, error: 'This invitation is no longer available.' });
-    }
-    res.json({
-      success: true,
-      data: {
-        email: invite.email,
-        firstName: invite.firstName,
-        lastName: invite.lastName,
-        propertyName: property.name,
-        unitNumber: unit.number,
-        rent: unit.rent,
-        expiresAt: invite.expiresAt,
-      },
-    });
+    return res.status(503).json({ success: false, error: 'Invitation service is temporarily unavailable.' });
   });
 
   app.post('/api/tenant-invitations/:token/accept', inviteAcceptLimiter, async (req, res) => {
@@ -1266,60 +1138,7 @@ async function startServer() {
     if (dbResult && dbResult.type === 'success') {
       return res.status(dbResult.status).json({ success: true, ...dbResult.data });
     }
-
-    const invite = tenantInvitations.find((item) => item.tokenHash === tokenHash);
-    if (!invite || invite.accepted || invite.expiresAt <= Date.now()) {
-      return res.status(404).json({ success: false, error: 'This invitation is invalid or has expired.' });
-    }
-    const password = sanitizeString(req.body.password);
-    if (!isStrongPassword(password)) {
-      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters long.' });
-    }
-    if (users.some((user) => user.email === invite.email)) {
-      return res.status(409).json({ success: false, error: 'An account already exists for this invitation email.' });
-    }
-
-    const unit = units.find((item) => item.id === invite.unitId);
-    const property = unit && properties.find((item) => item.id === unit.propertyId);
-    if (!unit || !property || property.landlordId !== invite.landlordId || unit.status.toLowerCase() !== 'vacant' || unit.tenantId) {
-      return res.status(409).json({ success: false, error: 'The unit is no longer available. Contact your landlord.' });
-    }
-
-    const newUser: User = {
-      id: createId('user'),
-      firstName: invite.firstName,
-      lastName: invite.lastName,
-      email: invite.email,
-      role: 'tenant',
-      passwordHash: bcrypt.hashSync(password, 10),
-    };
-    const tenant: Tenant = {
-      id: createId('tenant'),
-      landlordId: invite.landlordId,
-      userId: newUser.id,
-      firstName: invite.firstName,
-      lastName: invite.lastName,
-      email: invite.email,
-      phone: invite.phone,
-      unitId: unit.id,
-      status: 'Active',
-      leaseStart: invite.leaseStart,
-      leaseEnd: invite.leaseEnd,
-      rent: unit.rent,
-    };
-
-    users.push(newUser);
-    tenants.push(tenant);
-    unit.tenantId = tenant.id;
-    unit.status = 'occupied';
-    property.occupancy = Math.min(property.occupancy + 1, property.units);
-    invite.accepted = true;
-
-    res.status(201).json({
-      success: true,
-      user: { id: newUser.id, firstName: newUser.firstName, lastName: newUser.lastName, email: newUser.email, role: newUser.role },
-      token: createAuthToken(newUser),
-    });
+    return res.status(503).json({ success: false, error: 'Invitation service is temporarily unavailable.' });
   });
 
   app.get('/api/dashboard-stats', async (_req, res) => {
@@ -1480,6 +1299,173 @@ async function startServer() {
     res.json({ success: true, message: 'Property deleted.' });
   });
 
+  app.get('/api/listings', async (_req, res) => {
+    try {
+      const records = await prisma.unit.findMany({
+        where: {
+          isListed: true,
+          status: 'vacant',
+          property: { status: 'Active' },
+        },
+        include: {
+          property: { select: { id: true, name: true, city: true, state: true } },
+        },
+        orderBy: { updatedAt: 'desc' },
+      });
+      return res.json({
+        success: true,
+        data: records.map((unit) => ({
+          id: unit.id,
+          number: unit.number,
+          floor: unit.floor,
+          bedrooms: unit.bedrooms,
+          bathrooms: unit.bathrooms,
+          rent: unit.rent,
+          description: unit.listingDescription,
+          property: unit.property,
+        })),
+      });
+    } catch (error) {
+      console.error('Unable to load public listings:', error);
+      return res.status(503).json({ success: false, error: 'Homes are temporarily unavailable. Please try again shortly.' });
+    }
+  });
+
+  app.post('/api/viewing-requests', requireRole('tenant'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const unitId = sanitizeString(req.body?.unitId);
+    const message = sanitizeString(req.body?.message);
+    if (!unitId || message.length > 1000) {
+      return res.status(400).json({ success: false, error: 'Choose a home and keep your message under 1,000 characters.' });
+    }
+
+    try {
+      const unit = await prisma.unit.findFirst({
+        where: { id: unitId, isListed: true, status: 'vacant', property: { status: 'Active' } },
+        select: { id: true },
+      });
+      if (!unit) return res.status(404).json({ success: false, error: 'This home is no longer available.' });
+
+      const existingRequest = await prisma.viewingRequest.findFirst({
+        where: { unitId, tenantId: user.sub, status: 'pending' },
+        select: { id: true },
+      });
+      if (existingRequest) {
+        return res.status(409).json({ success: false, error: 'You already have a pending viewing request for this home.' });
+      }
+
+      const viewingRequest = await prisma.viewingRequest.create({
+        data: { unitId, tenantId: user.sub, message: message || null },
+        select: { id: true, status: true, createdAt: true },
+      });
+      return res.status(201).json({ success: true, data: viewingRequest });
+    } catch (error) {
+      console.error('Unable to create viewing request:', error);
+      return res.status(503).json({ success: false, error: 'Viewing requests are temporarily unavailable. Please try again shortly.' });
+    }
+  });
+
+  app.get('/api/viewing-requests', requireRole('tenant', 'landlord'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const where = user.role === 'landlord'
+      ? { unit: { property: { landlordId: user.sub } } }
+      : { tenantId: user.sub };
+
+    try {
+      const records = await prisma.viewingRequest.findMany({
+        where,
+        include: {
+          tenant: { select: { email: true } },
+          unit: {
+            select: {
+              id: true,
+              number: true,
+              rent: true,
+              property: { select: { name: true, city: true, state: true } },
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      return res.json({
+        success: true,
+        data: records.map((record) => ({
+          id: record.id,
+          status: record.status,
+          message: record.message,
+          createdAt: record.createdAt,
+          tenantEmail: user.role === 'landlord' ? record.tenant.email : undefined,
+          unit: record.unit,
+        })),
+      });
+    } catch (error) {
+      console.error('Unable to load viewing requests:', error);
+      return res.status(503).json({ success: false, error: 'Viewing requests are temporarily unavailable. Please try again shortly.' });
+    }
+  });
+
+  app.patch('/api/viewing-requests/:id', requireRole('landlord'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const status = req.body?.status;
+    if (!['approved', 'declined'].includes(status)) {
+      return res.status(400).json({ success: false, error: 'Choose confirm or decline for this request.' });
+    }
+
+    try {
+      const request = await prisma.viewingRequest.findUnique({
+        where: { id: req.params.id },
+        include: { unit: { select: { property: { select: { landlordId: true } } } } },
+      });
+      if (!request || request.unit.property.landlordId !== user.sub) {
+        return res.status(404).json({ success: false, error: 'Viewing request not found.' });
+      }
+      if (request.status !== 'pending') {
+        return res.status(409).json({ success: false, error: 'This viewing request has already been reviewed.' });
+      }
+
+      const updated = await prisma.viewingRequest.update({
+        where: { id: request.id },
+        data: { status },
+        select: { id: true, status: true, updatedAt: true },
+      });
+      return res.json({ success: true, data: updated });
+    } catch (error) {
+      console.error('Unable to review viewing request:', error);
+      return res.status(503).json({ success: false, error: 'Viewing requests are temporarily unavailable. Please try again shortly.' });
+    }
+  });
+
+  app.put('/api/units/:id/listing', requireRole('landlord'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const isListed = req.body?.isListed;
+    const listingDescription = sanitizeString(req.body?.listingDescription);
+    if (typeof isListed !== 'boolean' || listingDescription.length > 1000) {
+      return res.status(400).json({ success: false, error: 'Provide a listing status and a description under 1,000 characters.' });
+    }
+
+    try {
+      const unit = await prisma.unit.findUnique({
+        where: { id: req.params.id },
+        include: { property: { select: { landlordId: true } } },
+      });
+      if (!unit || unit.property.landlordId !== user.sub) {
+        return res.status(404).json({ success: false, error: 'Unit not found.' });
+      }
+      if (isListed && unit.status !== 'vacant') {
+        return res.status(409).json({ success: false, error: 'Only vacant units can be listed.' });
+      }
+
+      const updated = await prisma.unit.update({
+        where: { id: unit.id },
+        data: { isListed, listingDescription: listingDescription || null },
+      });
+      return res.json({ success: true, data: mapDbUnit(updated) });
+    } catch (error) {
+      console.error('Unable to update listing:', error);
+      return res.status(503).json({ success: false, error: 'Listing updates are temporarily unavailable. Please try again shortly.' });
+    }
+  });
+
   app.get('/api/units', async (req, res) => {
     const { propertyId, status } = req.query;
     const user = (req as AuthRequest).user;
@@ -1525,28 +1511,47 @@ async function startServer() {
     res.json({ success: true, data: results });
   });
 
-  app.post('/api/units', requireRole('landlord', 'admin'), (req, res) => {
-    const { propertyId, number, floor, bedrooms, bathrooms, rent, status, tenantId } = req.body;
-    if (!propertyId || !number) {
+  app.post('/api/units', requireRole('landlord', 'admin'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const { propertyId, number, floor, bedrooms, bathrooms, rent, status } = req.body;
+    const unitNumber = sanitizeString(number);
+    const listingDescription = sanitizeString(req.body?.listingDescription);
+    if (!propertyId || !unitNumber) {
       return res.status(400).json({ success: false, error: 'Property ID and unit number are required.' });
     }
-    const property = properties.find((item) => item.id === propertyId);
-    if (!property || !canAccessProperty((req as AuthRequest).user, property)) {
-      return res.status(404).json({ success: false, error: 'Property not found.' });
+    if (listingDescription.length > 1000) {
+      return res.status(400).json({ success: false, error: 'Listing descriptions must be 1,000 characters or fewer.' });
     }
-    const unit: Unit = {
-      id: createId('unit'),
-      propertyId,
-      number,
-      floor: Number(floor || 1),
-      bedrooms: Number(bedrooms || 1),
-      bathrooms: Number(bathrooms || 1),
-      rent: Number(rent || 0),
-      status: status || 'vacant',
-      tenantId,
-    };
-    units.push(unit);
-    res.status(201).json({ success: true, data: unit });
+    if (!['vacant', 'maintenance'].includes(status ?? 'vacant')) {
+      return res.status(400).json({ success: false, error: 'New units must be vacant or under maintenance.' });
+    }
+
+    try {
+      const property = await prisma.property.findUnique({
+        where: { id: String(propertyId) },
+        select: { id: true, landlordId: true },
+      });
+      if (!property || (user.role !== 'admin' && property.landlordId !== user.sub)) {
+        return res.status(404).json({ success: false, error: 'Property not found.' });
+      }
+
+      const record = await prisma.unit.create({
+        data: {
+          propertyId: property.id,
+          number: unitNumber,
+          floor: Number(floor || 1),
+          bedrooms: Number(bedrooms || 1),
+          bathrooms: Number(bathrooms || 1),
+          rent: Number(rent || 0),
+          status: status || 'vacant',
+          listingDescription: listingDescription || null,
+        },
+      });
+      return res.status(201).json({ success: true, data: mapDbUnit(record) });
+    } catch (error) {
+      console.error('Unable to create unit:', error);
+      return res.status(503).json({ success: false, error: 'Units are temporarily unavailable. Please try again shortly.' });
+    }
   });
 
   app.put('/api/units/:id', (req, res) => {

@@ -5,26 +5,24 @@ import { DashboardLayout } from './layouts/DashboardLayout';
 import { Landing, About, Contact, LoginRegister, NotFound, Pricing, PrivacyPolicy, ThankYou } from './pages/public';
 import { TenantInvite } from './pages/public/TenantInvite';
 import { useAuth } from './hooks/useAuth';
-import { 
-  LandlordDashboard, LandlordProperties, LandlordUnits, LandlordPayments, 
-  LandlordReports, LandlordMessages, LandlordMaintenance, LandlordAnalytics,
-  LandlordSettings
-} from './pages/landlord';
+import { LandlordDashboard, LandlordProperties, LandlordUnits, LandlordPayments, LandlordReports, LandlordMessages, LandlordMaintenance, LandlordAnalytics,
+  LandlordSettings} from './pages/landlord';
 import { LandlordTenants } from './pages/landlord/Tenants';
 import { LandlordPropertyDetails } from './pages/landlord/PropertyDetails';
+import { LandlordViewings } from './pages/landlord/Viewings';
+import { TenantHomes } from './pages/tenant/Homes';
 import { 
   TenantDashboard, TenantPayments, TenantMaintenance, 
   TenantMessages, TenantDocuments, TenantSettings 
 } from './pages/tenant';
-import { 
-  AdminDashboard, AdminProperties, AdminUnits, AdminTenants, 
+import { AdminDashboard, AdminProperties, AdminUnits, AdminTenants, 
   AdminPayments, AdminMessages, AdminMaintenance, AdminAnalytics, AdminReports,
   AdminSettings
 } from './pages/admin';
 import { 
   Building, Users, FileText, Settings, Activity, 
   CreditCard, MessageSquare, Wrench, BarChart3, 
-  FileDigit, Box, Home, Shield, Globe, DollarSign,
+  FileDigit, Box, Home, CalendarDays, Shield, Globe, DollarSign,
   Headset, Server, FileCheck
 } from 'lucide-react';
 
@@ -33,6 +31,7 @@ export default function App() {
     { icon: <Activity className="w-4 h-4" />, label: "Dashboard", path: "/landlord" },
     { icon: <Building className="w-4 h-4" />, label: "Properties", path: "/landlord/properties" },
     { icon: <Box className="w-4 h-4" />, label: "Units", path: "/landlord/units" },
+    { icon: <CalendarDays className="w-4 h-4" />, label: "Viewing Requests", path: "/landlord/viewings" },
     { icon: <Users className="w-4 h-4" />, label: "Tenants", path: "/landlord/tenants" },
     { icon: <CreditCard className="w-4 h-4" />, label: "Payments", path: "/landlord/payments" },
     { icon: <MessageSquare className="w-4 h-4" />, label: "Messages", path: "/landlord/messages" },
@@ -44,6 +43,7 @@ export default function App() {
 
   const tenantNav = [
     { icon: <Activity className="w-4 h-4" />, label: "Dashboard", path: "/tenant" },
+    { icon: <Home className="w-4 h-4" />, label: "Homes", path: "/tenant/homes" },
     { icon: <CreditCard className="w-4 h-4" />, label: "Payments", path: "/tenant/payments" },
     { icon: <Wrench className="w-4 h-4" />, label: "Maintenance", path: "/tenant/maintenance" },
     { icon: <MessageSquare className="w-4 h-4" />, label: "Messages", path: "/tenant/messages" },
@@ -98,6 +98,7 @@ export default function App() {
           </RequireAuth>
         }>
           <Route index element={<TenantDashboard />} />
+          <Route path="homes" element={<TenantHomes />} />
           <Route path="payments" element={<TenantPayments />} />
           <Route path="maintenance" element={<TenantMaintenance />} />
           <Route path="messages" element={<TenantMessages />} />
@@ -117,6 +118,7 @@ export default function App() {
           <Route path="properties" element={<LandlordProperties />} />
           <Route path="properties/:id" element={<LandlordPropertyDetails />} />
           <Route path="units" element={<LandlordUnits />} />
+          <Route path="viewings" element={<LandlordViewings />} />
           <Route path="tenants" element={<LandlordTenants />} />
           <Route path="payments" element={<LandlordPayments />} />
           <Route path="reports" element={<LandlordReports />} />

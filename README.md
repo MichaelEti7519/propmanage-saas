@@ -27,6 +27,7 @@ This project is currently in active development. The frontend and route structur
 - JWT auth flow and protected routes
 - Property and unit management UI
 - Tenant invitation flow and acceptance flow
+- Landlords can publish vacant units; tenants can request viewings with their account email, and landlords confirm or decline without automatic assignment
 - Express API with rate limits and security middleware
 - Prisma schema for the core SaaS entities
 - Postgres-ready setup for the next deployment stage
@@ -34,6 +35,7 @@ This project is currently in active development. The frontend and route structur
 
 **In progress:**
 - Full database-backed persistence for every route
+- Apply and test the home-listing/viewing-request migration after PostgreSQL credentials are corrected
 - Stripe-based rent payment integration
 - Production deployment config
 - Final testing and visual QA

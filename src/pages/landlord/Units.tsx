@@ -9,7 +9,8 @@ import {
   DollarSign,
   Wrench,
   CheckCircle2,
-  MoreVertical,
+  Eye,
+  EyeOff,
   X,
 } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
@@ -31,6 +32,8 @@ interface ApiUnit {
   rent: number;
   status: string;
   tenantId?: string;
+  isListed?: boolean;
+  listingDescription?: string;
 }
 
 interface Tenant {
@@ -63,6 +66,8 @@ export const LandlordUnits = () => {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [listingError, setListingError] = useState<string | null>(null);
+  const [updatingListingId, setUpdatingListingId] = useState<string | null>(null);
   const [form, setForm] = useState({
     propertyId: requestedPropertyId || '',
     number: '',
@@ -71,6 +76,7 @@ export const LandlordUnits = () => {
     bathrooms: '1',
     rent: '0',
     status: 'vacant',
+    listingDescription: '',
   });
 
   useEffect(() => {
@@ -148,6 +154,7 @@ export const LandlordUnits = () => {
       bathrooms: '1',
       rent: '0',
       status: 'vacant',
+      listingDescription: '',
     });
     setFormError(null);
     setIsFormOpen(true);
@@ -173,6 +180,7 @@ export const LandlordUnits = () => {
           bathrooms: Number(form.bathrooms),
           rent: Number(form.rent),
           status: form.status,
+          listingDescription: form.listingDescription.trim(),
         }),
       });
       const data = await response.json();
@@ -184,6 +192,27 @@ export const LandlordUnits = () => {
       setFormError(err instanceof Error ? err.message : 'Unable to create unit.');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const toggleListing = async (unit: Unit) => {
+    setListingError(null);
+    setUpdatingListingId(unit.id);
+    try {
+      const response = await fetchWithAuth(`/api/units/${unit.id}/listing`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          isListed: !unit.isListed,
+          listingDescription: unit.listingDescription ?? '',
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) throw new Error(data.error || 'Unable to update listing.');
+      setUnits((current) => current.map((item) => item.id === unit.id ? { ...item, ...data.data } : item));
+    } catch (err) {
+      setListingError(err instanceof Error ? err.message : 'Unable to update listing.');
+    } finally {
+      setUpdatingListingId(null);
     }
   };
 
@@ -204,6 +233,7 @@ export const LandlordUnits = () => {
         </div>
 
         {error && <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-4 text-red-700">{error}</div>}
+        {listingError && <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-4 text-red-700">{listingError}</div>}
         {!loading && properties.length === 0 && !error && (
           <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-800">Create a property before adding units.</div>
         )}
@@ -250,9 +280,20 @@ export const LandlordUnits = () => {
                     <div className="flex items-center justify-between"><span className="text-sm font-medium text-slate-500">Monthly Rent</span><span className="font-bold text-slate-900 flex items-center"><DollarSign className="w-4 h-4 text-emerald-500" />{unit.rent.toLocaleString()}</span></div>
                     {unit.tenant && <div className="mt-4 flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50 p-3"><Users className="w-4 h-4 text-indigo-600" /><span className="truncate text-sm font-semibold text-slate-900">{unit.tenant}</span></div>}
                   </div>
-                  <div className="px-5 py-3 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
+                  <div className="px-5 py-3 bg-slate-50 border-t border-slate-100 flex items-center justify-between gap-3">
                     <span className="text-sm text-slate-500">{unit.tenant ? `Lease ends: ${unit.leaseEnd || 'Not set'}` : status === 'Vacant' ? 'Ready for rent' : 'Work in progress'}</span>
-                    <button type="button" title="Unit actions" className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-200 rounded-lg"><MoreVertical className="w-4 h-4" /></button>
+                    {unit.status === 'vacant' && (
+                      <button
+                        type="button"
+                        onClick={() => toggleListing(unit)}
+                        disabled={updatingListingId === unit.id}
+                        aria-pressed={Boolean(unit.isListed)}
+                        className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:cursor-wait disabled:opacity-60"
+                      >
+                        {unit.isListed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                        {unit.isListed ? 'Unlist' : 'List home'}
+                      </button>
+                    )}
                   </div>
                 </div>
               );
@@ -274,9 +315,10 @@ export const LandlordUnits = () => {
                   <label className="space-y-1 text-sm font-medium text-slate-700">Unit number<input value={form.number} onChange={(event) => setForm((current) => ({ ...current, number: event.target.value }))} className={inputClassName} placeholder="2A" required /></label>
                   <label className="space-y-1 text-sm font-medium text-slate-700">Floor<input type="number" min="0" value={form.floor} onChange={(event) => setForm((current) => ({ ...current, floor: event.target.value }))} className={inputClassName} /></label>
                   <label className="space-y-1 text-sm font-medium text-slate-700">Bedrooms<input type="number" min="0" value={form.bedrooms} onChange={(event) => setForm((current) => ({ ...current, bedrooms: event.target.value }))} className={inputClassName} /></label>
-                  <label className="space-y-1 text-sm font-medium text-slate-700">Bathrooms<input type="number" min="0" step="0.5" value={form.bathrooms} onChange={(event) => setForm((current) => ({ ...current, bathrooms: event.target.value }))} className={inputClassName} /></label>
+                  <label className="space-y-1 text-sm font-medium text-slate-700">Bathrooms<input type="number" min="0" step="1" value={form.bathrooms} onChange={(event) => setForm((current) => ({ ...current, bathrooms: event.target.value }))} className={inputClassName} /></label>
                   <label className="space-y-1 text-sm font-medium text-slate-700">Monthly rent<input type="number" min="0" value={form.rent} onChange={(event) => setForm((current) => ({ ...current, rent: event.target.value }))} className={inputClassName} /></label>
                   <label className="space-y-1 text-sm font-medium text-slate-700">Status<select value={form.status} onChange={(event) => setForm((current) => ({ ...current, status: event.target.value }))} className={inputClassName}><option value="vacant">Vacant</option><option value="maintenance">Maintenance</option></select></label>
+                  <label className="space-y-1 text-sm font-medium text-slate-700 sm:col-span-2">Public listing description (optional)<textarea maxLength={1000} value={form.listingDescription} onChange={(event) => setForm((current) => ({ ...current, listingDescription: event.target.value }))} className={inputClassName} rows={3} placeholder="Describe the home and its features. Do not include private documents or personal information." /></label>
                 </div>
                 {formError && <div role="alert" className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{formError}</div>}
                 <div className="flex justify-end gap-3 border-t border-slate-200 pt-4"><button type="button" onClick={() => setIsFormOpen(false)} className="rounded-xl border border-slate-200 px-4 py-2.5 font-medium text-slate-700 hover:bg-slate-50">Cancel</button><button type="submit" disabled={submitting} className="rounded-xl bg-indigo-600 px-4 py-2.5 font-medium text-white hover:bg-indigo-700 disabled:opacity-70">{submitting ? 'Saving...' : 'Save Unit'}</button></div>
