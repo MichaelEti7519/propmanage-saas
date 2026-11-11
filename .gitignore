@@ -5,4 +5,9 @@ coverage/
 .DS_Store
 *.log
 .env*
-!.env.example
+
+# Agent notes and tool caches: keep them on disk, never in the repo.
+AGENTS.md
+CLAUDE.md
+.qoder/
+.continue/
