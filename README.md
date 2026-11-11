@@ -54,7 +54,7 @@ Dashboard metrics, property rows, and payment figures are **illustrative sample 
 ## Requirements
 
 - Node.js 20+
-- PostgreSQL 14+ running locally (or a connection string you control)
+- PostgreSQL 14+ installed locally (or a connection string you control). Development uses a project-owned cluster, so no Windows service or admin rights are needed
 - A `JWT_SECRET` of **at least 32 characters** — the server refuses to start without it
 
 ## Local setup
@@ -81,20 +81,30 @@ Dashboard metrics, property rows, and payment figures are **illustrative sample 
    | `EMAIL_FROM` | no | Defaults to `PropManage <onboarding@resend.dev>` |
    | `GEMINI_API_KEY` | no | Only needed for the document-scan endpoint; returns `500` when unset |
 
-4. Start PostgreSQL and create the database:
+4. Start the local database. The project runs its own PostgreSQL cluster in `.pgdata` (git-ignored) on port `5433`, which needs neither the Windows service nor admin rights. Create it once, then start it:
 
    ```
-   createdb propmanage
+   initdb -D .pgdata -U postgres -A trust -E UTF8
+   npm run db:start
+   createdb -h localhost -p 5433 -U postgres propmanage
    ```
+
+   If those binaries are not on `PATH`, prefix them with `C:\Program Files\PostgreSQL\18\bin\`. The cluster does not start at boot: run `npm run db:start` after a reboot and `npm run db:stop` to shut it down. Point `.env` at it:
+
+   ```
+   DATABASE_URL="postgresql://postgres@localhost:5433/propmanage?schema=public"
+   ```
+
+   Local connections are trusted, which is why that URL has no password. To use a hosted database instead, replace this single value — nothing else changes.
 
 5. Generate the Prisma client and apply the schema:
 
    ```
    npx prisma generate
-   npx prisma migrate dev --name init
+   npx prisma migrate dev
    ```
 
-   `prisma/migrations/` does not exist yet, so this command creates the first migration. Do not run it against a shared or production database without review.
+   The initial migration is committed, so this applies the existing schema. Do not run it against a shared or production database without review; use `npx prisma migrate deploy` there.
 
 6. Optional — seed demo accounts:
 
@@ -123,6 +133,9 @@ Dashboard metrics, property rows, and payment figures are **illustrative sample 
 | `npm run prisma:generate` | Regenerate the Prisma client |
 | `npm run prisma:migrate` | `prisma migrate dev --name init` |
 | `npm run db:seed` | Seed local demo accounts and fixtures |
+| `npm run db:start` | Start the project database cluster (`.pgdata`, port `5433`) |
+| `npm run db:stop` | Stop the project database cluster |
+| `npm run db:status` | Report whether the cluster is running, and on which port |
 
 Use `npx prisma migrate status` to check whether the database is in sync with `schema.prisma`.
 
@@ -166,7 +179,7 @@ These limits are deliberately tight, and they are currently the most common caus
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `npm run dev` exits immediately with a `JWT_SECRET` error | Secret is shorter than 32 characters | Generate one: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` and paste it into `.env` |
-| Login/register returns `503` | Database unreachable, or `prisma migrate dev` never ran | Start PostgreSQL, confirm `DATABASE_URL`, then run `npx prisma migrate dev --name init` |
+| Login/register returns `503` | Database unreachable, or migrations were never applied | Run `npm run db:start`, confirm `DATABASE_URL`, then `npx prisma migrate dev` |
 | Login returns `429` | Too many failed attempts, or repeated `/api/auth/me` calls with a stale token | Wait for the window to pass, or clear `propmanage_token` from `localStorage` |
 | Registration returns `429` | Five registration attempts (including failed validation) in an hour | Wait, or restart the dev server to reset the in-memory store |
 | Registration returns `400` about password length | Server requires 12+ characters while the form allows 8 | Use a longer password until the form and server rules are aligned |

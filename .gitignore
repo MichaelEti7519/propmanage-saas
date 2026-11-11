@@ -6,6 +6,9 @@ coverage/
 *.log
 .env*
 
+# Local database cluster (created by npm run db:start)
+.pgdata/
+
 # Agent notes and tool caches: keep them on disk, never in the repo.
 AGENTS.md
 CLAUDE.md

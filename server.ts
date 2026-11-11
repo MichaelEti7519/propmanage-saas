@@ -875,7 +875,10 @@ async function startServer() {
     if (!authReq.user) {
       return res.status(401).json({ success: false, error: 'Not authenticated.' });
     }
-    res.json({ success: true, user: authReq.user });
+    // Return the same user shape as /api/auth/login. The raw JWT payload exposes
+    // `sub`, but the client stores `id`, so reloads would otherwise lose the user id.
+    const { sub, email, role, firstName, lastName } = authReq.user;
+    res.json({ success: true, user: { id: sub, email, role, firstName, lastName } });
   });
 
   app.post('/api/tenant-invitations', inviteCreateLimiter, requireRole('landlord'), async (req, res) => {
