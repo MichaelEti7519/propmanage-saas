@@ -33,9 +33,9 @@ export default function GlideSelect({
   const [uncontrolledValue, setUncontrolledValue] = useState(defaultValue ?? '');
   const selectedValue = value ?? uncontrolledValue;
   const selectedIndex = options.findIndex((option) => option.value === selectedValue);
-  const pillIndex = activeIndex ?? Math.max(0, selectedIndex);
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const pillIndex = activeIndex ?? Math.max(0, selectedIndex);
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const id = useId();
