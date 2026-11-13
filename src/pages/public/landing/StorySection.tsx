@@ -1,70 +1,70 @@
-import { AnimatedContent } from '../../../components/AnimatedContent';
-import { propertyPhotos } from './sampleData';
-import { displayHeading, eyebrow, pageShell, sectionY } from './theme';
+import { SectionHeading } from './SectionHeading';
+import { pageShell, sectionY } from './theme';
 
 const pillars = [
-  ['01', 'Properties'],
-  ['02', 'Tenants'],
-  ['03', 'Operations'],
+  ['01', 'Properties', 'Buildings and the units inside them.'],
+  ['02', 'Tenants', 'Who lives where, and on what terms.'],
+  ['03', 'Operations', 'Rent, repairs and the messages between.'],
 ];
 
 export function StorySection() {
   return (
     <>
-      <section className="border-y border-[#E8DDCC]/80 bg-white">
-        <div className={`${pageShell} flex flex-col gap-8 py-10 sm:flex-row sm:items-center sm:justify-between`}>
-          <p className="max-w-sm text-sm leading-6 text-[#756B61]">
-            A single workspace for the people, properties and responsibilities
-            that keep a rental business moving.
-          </p>
-
-          <dl className="grid grid-cols-3 gap-6 sm:gap-10">
-            {pillars.map(([number, label]) => (
-              <div key={number} className="border-l border-[#E8DDCC] pl-3 sm:pl-4">
-                <dt className="font-display text-[13px] font-semibold text-[#B9A58B]">{number}</dt>
-                <dd className="mt-1 text-xs font-medium text-[#332D29]">{label}</dd>
+      <section className="bg-white">
+        <div className={pageShell}>
+          <div className="grid gap-8 border-b border-[#E8DDCC]/70 py-9 sm:grid-cols-3 sm:gap-0">
+            {pillars.map(([number, label, description], index) => (
+              <div
+                key={number}
+                className={[
+                  'sm:px-7',
+                  index === 0 ? 'sm:pl-0' : 'sm:border-l sm:border-[#E8DDCC]',
+                  index === 2 ? 'sm:pr-0' : '',
+                ].join(' ')}
+              >
+                <p className="font-display text-[12px] font-semibold tracking-[0.14em] text-[#B9A58B]">
+                  {number}
+                </p>
+                <p className="mt-2 font-display text-lg font-semibold tracking-tight text-[#332D29]">
+                  {label}
+                </p>
+                <p className="mt-1 text-[12.5px] leading-6 text-[#756B61]">{description}</p>
               </div>
             ))}
-          </dl>
+          </div>
         </div>
       </section>
 
       <section className={`bg-[#FAF8F3] ${sectionY}`}>
-        <div className={`${pageShell} grid gap-12 md:grid-cols-[0.9fr_1.1fr] md:items-center md:gap-16`}>
-          <div className="max-w-md">
-            <p className={eyebrow}>The people behind every property</p>
-            <h2 className={`mt-4 text-3xl sm:text-4xl ${displayHeading}`}>
-              A tenancy is more than an address.
-            </h2>
-            <p className="mt-5 text-sm leading-7 text-[#756B61]">
-              Keep the place and the day-to-day experience in view, from a tenant&apos;s first message to the maintenance follow-through.
-            </p>
-          </div>
+        <div className={`${pageShell} grid gap-10 md:grid-cols-[0.9fr_1.1fr] md:items-center md:gap-20`}>
+          <SectionHeading
+            index="01"
+            eyebrowText="The people behind every property"
+            title="A tenancy is more than an address."
+            lede="Keep the place and the day-to-day experience in view — from a tenant’s first message to the maintenance follow-through."
+          />
 
-          <div className="grid grid-cols-2 items-start gap-4 sm:gap-6">
-            {propertyPhotos.slice(1).map((photo, index) => (
-              <AnimatedContent key={photo.label} delay={index * 0.08} distance={12} duration={0.42}>
-                <figure>
-                  <div className="overflow-hidden rounded-2xl bg-[#E8DDCC] ring-1 ring-[#332D29]/5">
-                    <img
-                      src={photo.src}
-                      alt={photo.alt}
-                      loading="lazy"
-                      className="aspect-[4/5] w-full object-cover transition-transform duration-500 hover:scale-[1.02]"
-                    />
-                  </div>
-                  <figcaption className="mt-3">
-                    <span className="flex items-baseline gap-2">
-                      <span aria-hidden="true" className="font-display text-[11px] font-semibold text-[#B9A58B]">
-                        {photo.label}
-                      </span>
-                      <span className="text-xs font-semibold text-[#332D29]">{photo.title}</span>
-                    </span>
-                    <span className="mt-1 block text-[11px] text-[#756B61]">{photo.location}</span>
-                  </figcaption>
-                </figure>
-              </AnimatedContent>
-            ))}
+          <div className="md:border-l md:border-[#B9A58B]/50 md:pl-10 lg:pl-14">
+            <p className="font-display text-[1.6rem] font-medium leading-[1.25] tracking-[-0.02em] text-[#332D29] sm:text-[1.9rem]">
+              Clear records. Clear communication.
+              <br className="hidden sm:block" /> Fewer loose ends.
+            </p>
+
+            <p className="mt-6 max-w-md text-[13.5px] leading-7 text-[#756B61]">
+              Every unit keeps its own history: who lives there, what they owe, what needs
+              fixing, and what was said about it. Nothing has to be reconstructed from memory.
+            </p>
+
+            <div className="mt-8 flex flex-wrap gap-x-6 gap-y-2 text-[11.5px] font-medium text-[#8A7E72]">
+              <span className="flex items-center gap-2">
+                <span aria-hidden="true" className="h-1 w-1 rounded-full bg-[#B9A58B]" />
+                One record per unit
+              </span>
+              <span className="flex items-center gap-2">
+                <span aria-hidden="true" className="h-1 w-1 rounded-full bg-[#B9A58B]" />
+                Shared between both sides
+              </span>
+            </div>
           </div>
         </div>
       </section>

@@ -103,8 +103,8 @@ export function PublicLayout() {
   return (
     <MotionConfig reducedMotion="user">
       <div className="flex min-h-screen flex-col bg-[#FAF8F3] font-sans text-[#332D29]">
-        <header className="sticky top-0 z-50 px-3 pt-3 sm:px-6">
-          <div className="mx-auto flex h-[66px] max-w-7xl items-center justify-between gap-4 rounded-[20px] border border-white/70 bg-[#FAF8F3]/75 px-4 shadow-[0_4px_20px_rgba(51,45,41,0.045)] backdrop-blur-2xl sm:px-6">
+        <header className="sticky top-0 z-50 border-b border-[#E8DDCC] bg-[#FAF8F3]">
+          <div className="mx-auto flex h-[68px] max-w-7xl items-center justify-between gap-4 px-5 sm:px-8 lg:px-12">
             <Link
               to="/"
               aria-label="PropManage home"
@@ -135,7 +135,7 @@ export function PublicLayout() {
                     damping: 32,
                     mass: 0.8,
                   }}
-                  className="pointer-events-none absolute left-0 top-0 h-full rounded-lg border border-[#E8DDCC]/80 bg-white/75 shadow-[0_1px_2px_rgba(51,45,41,0.04)]"
+                  className="pointer-events-none absolute bottom-0 left-0 h-[2px] bg-[#332D29]"
                 />
               )}
 
@@ -151,7 +151,7 @@ export function PublicLayout() {
                     to={link.path}
                     aria-current={active ? 'page' : undefined}
                     className={[
-                      'relative z-10 rounded-lg px-3 py-2 text-[13px]',
+                      'relative z-10 rounded-sm px-3 py-2.5 text-[13px]',
                       'transition-colors duration-200',
                       'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B]',
                       active
@@ -176,7 +176,7 @@ export function PublicLayout() {
 
               <Link
                 to="/login"
-                className="group hidden min-h-10 items-center gap-2 rounded-xl bg-[#332D29] px-[18px] py-2 text-[13px] font-semibold text-[#FAF8F3] transition-[background-color,transform] duration-200 hover:-translate-y-px hover:bg-[#494039] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B] focus-visible:ring-offset-2 sm:inline-flex"
+                className="group hidden min-h-10 items-center gap-2 rounded-lg bg-[#332D29] px-[18px] py-2 text-[13px] font-semibold text-[#FAF8F3] transition-[background-color,transform] duration-200 hover:-translate-y-px hover:bg-[#494039] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B] focus-visible:ring-offset-2 sm:inline-flex"
               >
                 Get started
                 <ArrowUpRight
@@ -187,7 +187,7 @@ export function PublicLayout() {
 
               <button
                 type="button"
-                className="inline-flex h-10 w-10 items-center justify-center rounded-xl text-[#332D29] transition-colors hover:bg-white/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B] xl:hidden"
+                className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-[#332D29] transition-colors hover:bg-[#E8DDCC]/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B] xl:hidden"
                 onClick={() => setIsMobileMenuOpen((open) => !open)}
                 aria-label={
                   isMobileMenuOpen
@@ -216,7 +216,7 @@ export function PublicLayout() {
                 exit={{ opacity: 0, y: -8, scale: 0.98 }}
                 transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
                 style={{ transformOrigin: 'top center' }}
-                className="absolute inset-x-3 top-[84px] z-50 mx-auto max-w-7xl rounded-2xl border border-[#E8DDCC] bg-[#FAF8F3]/95 p-3 shadow-[0_16px_40px_rgba(51,45,41,0.12)] backdrop-blur-2xl sm:inset-x-6 xl:hidden"
+                className="absolute inset-x-0 top-full z-50 border-b border-[#E8DDCC] bg-[#FAF8F3] px-5 pb-5 pt-2 shadow-[0_18px_30px_-26px_rgba(51,45,41,0.4)] sm:px-8 xl:hidden"
               >
                 <div className="flex flex-col gap-1">
                   {navLinks.map((link) => {
@@ -228,19 +228,13 @@ export function PublicLayout() {
                         to={link.path}
                         aria-current={active ? 'page' : undefined}
                         className={[
-                          'flex min-h-11 items-center justify-between rounded-xl px-3.5 py-2.5 text-sm transition-colors',
+                          'flex min-h-11 items-center justify-between rounded-md px-3.5 py-2.5 text-sm transition-colors',
                           active
                             ? 'bg-white font-semibold text-[#332D29]'
                             : 'font-medium text-[#756B61] hover:bg-white/70 hover:text-[#332D29]',
                         ].join(' ')}
                       >
                         {link.name}
-                        {active && (
-                          <span
-                            aria-hidden="true"
-                            className="h-1.5 w-1.5 rounded-full bg-[#397451]"
-                          />
-                        )}
                       </Link>
                     );
                   })}
@@ -249,14 +243,14 @@ export function PublicLayout() {
 
                   <Link
                     to="/login"
-                    className="flex min-h-11 items-center rounded-xl px-3.5 py-2.5 text-sm font-medium text-[#332D29] hover:bg-white/70"
+                    className="flex min-h-11 items-center rounded-md px-3.5 py-2.5 text-sm font-medium text-[#332D29] hover:bg-white/70"
                   >
                     Log in
                   </Link>
 
                   <Link
                     to="/login"
-                    className="mt-1 flex min-h-11 items-center justify-center gap-2 rounded-xl bg-[#332D29] px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#494039]"
+                    className="mt-1 flex min-h-11 items-center justify-center gap-2 rounded-lg bg-[#332D29] px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#494039]"
                   >
                     Get started
                     <ArrowUpRight size={16} />

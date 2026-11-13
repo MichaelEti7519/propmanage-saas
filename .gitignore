@@ -9,8 +9,12 @@ coverage/
 # Local database cluster (created by npm run db:start)
 .pgdata/
 
+# User uploads (avatars)
+uploads/
+
 # Agent notes and tool caches: keep them on disk, never in the repo.
 AGENTS.md
 CLAUDE.md
 .qoder/
 .continue/
+

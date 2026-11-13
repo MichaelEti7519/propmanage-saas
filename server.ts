@@ -5,6 +5,7 @@ import express from "express";
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import { createHash, randomBytes, randomUUID } from 'crypto';
+import { promises as fsp } from 'fs';
 import rateLimit from 'express-rate-limit';
 import path from "path";
 import { createServer as createViteServer } from "vite";
@@ -21,6 +22,7 @@ interface User {
   email: string;
   role: 'landlord' | 'tenant' | 'admin';
   phone?: string;
+  avatarUrl?: string;
   emailVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
   phoneVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
   identityVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
@@ -151,6 +153,32 @@ function mapDbTenant(tenant: any): Tenant {
 // Token revocation and login protections (in-memory)
 const tokenBlacklist = new Set<string>();
 const revokedBefore: Record<string, number> = {};
+
+// Avatars are stored outside the bundle. The extension comes from the file signature
+// rather than the client's Content-Type, so a mislabelled upload cannot land as HTML.
+const UPLOAD_ROOT = path.join(process.cwd(), 'uploads');
+const AVATAR_DIR = path.join(UPLOAD_ROOT, 'avatars');
+const MAX_AVATAR_BYTES = 800 * 1024;
+
+function detectAvatarExtension(buffer: Buffer): 'png' | 'jpg' | 'gif' | null {
+  if (buffer.length < 12) return null;
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return 'png';
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'jpg';
+  if (buffer.subarray(0, 4).toString('ascii') === 'GIF8') return 'gif';
+  return null;
+}
+
+function serializeAccount(user: User) {
+  return {
+    id: user.id,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    email: user.email,
+    phone: user.phone ?? null,
+    role: user.role,
+    avatarUrl: user.avatarUrl ?? null,
+  };
+}
 function createAuthToken(user: User) {
   const jti = randomUUID();
   return jwt.sign(
@@ -388,7 +416,7 @@ async function startServer() {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'", "'unsafe-inline'", 'https://cdn.jsdelivr.net'],
         styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
-        imgSrc: ["'self'", 'data:', 'https://images.unsplash.com', 'https://purecatamphetamine.github.io'],
+        imgSrc: ["'self'", 'data:', 'https://images.unsplash.com'],
         connectSrc: [
           "'self'",
           'https://api.github.com',
@@ -419,6 +447,14 @@ async function startServer() {
 
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ limit: '32kb', extended: true }));
+
+  // Uploaded avatars are served from disk. Filenames carry a timestamp, so they can be
+  // cached aggressively while a replacement takes effect immediately.
+  app.use('/uploads', express.static(UPLOAD_ROOT, {
+    index: false,
+    dotfiles: 'ignore',
+    maxAge: '7d',
+  }));
 
   const apiLimiter = rateLimit({
     windowMs: 60 * 1000,
@@ -778,6 +814,8 @@ async function startServer() {
           lastName: newUser.lastName,
           email: newUser.email,
           role: newUser.role,
+          phone: newUser.phone ?? null,
+          avatarUrl: null,
           emailVerificationStatus: newUser.emailVerificationStatus,
           phoneVerificationStatus: newUser.phoneVerificationStatus,
           identityVerificationStatus: newUser.identityVerificationStatus,
@@ -826,7 +864,7 @@ async function startServer() {
     }
 
     const token = createAuthToken(user);
-    res.json({ success: true, user: { id: user.id, firstName: user.firstName, lastName: user.lastName, email: user.email, role: user.role }, token });
+    res.json({ success: true, user: serializeAccount(user), token });
   });
 
   app.post('/api/auth/logout', (req, res) => {
@@ -870,15 +908,113 @@ async function startServer() {
     }
   });
 
-  app.get('/api/auth/me', (req, res) => {
+  app.get('/api/auth/me', async (req, res) => {
     const authReq = req as AuthRequest;
     if (!authReq.user) {
       return res.status(401).json({ success: false, error: 'Not authenticated.' });
     }
-    // Return the same user shape as /api/auth/login. The raw JWT payload exposes
-    // `sub`, but the client stores `id`, so reloads would otherwise lose the user id.
+
+    // Read through to the database so renames and avatars survive a page reload. The JWT
+    // only carries the identity, so the raw claims are the fallback, not the source of truth.
+    try {
+      const dbUser = await prisma.user.findUnique({ where: { id: authReq.user.sub } });
+      if (dbUser) {
+        return res.json({ success: true, user: serializeAccount({ ...dbUser, phone: dbUser.phone ?? undefined }) });
+      }
+    } catch (error) {
+      console.error('Unable to load account for session refresh:', error);
+    }
+
     const { sub, email, role, firstName, lastName } = authReq.user;
-    res.json({ success: true, user: { id: sub, email, role, firstName, lastName } });
+    return res.json({
+      success: true,
+      user: { id: sub, email, role, firstName, lastName, phone: null, avatarUrl: null },
+    });
+  });
+
+  app.patch('/api/users/me', async (req, res) => {
+    const authReq = req as AuthRequest;
+    if (!authReq.user) return res.status(401).json({ success: false, error: 'Not authenticated.' });
+
+    const firstName = sanitizeString(req.body?.firstName);
+    const lastName = sanitizeString(req.body?.lastName);
+    const phone = sanitizeString(req.body?.phone);
+
+    if (!firstName || !lastName) {
+      return res.status(400).json({ success: false, error: 'First name and last name are required.' });
+    }
+    if (firstName.length > 60 || lastName.length > 60) {
+      return res.status(400).json({ success: false, error: 'Names must be 60 characters or fewer.' });
+    }
+    if (phone.length > 32) {
+      return res.status(400).json({ success: false, error: 'Phone number must be 32 characters or fewer.' });
+    }
+
+    try {
+      const updated = await prisma.user.update({
+        where: { id: authReq.user.sub },
+        data: { firstName, lastName, phone: phone || null },
+      });
+      return res.json({ success: true, user: serializeAccount({ ...updated, phone: updated.phone ?? undefined }) });
+    } catch (error) {
+      if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2025') {
+        return res.status(404).json({ success: false, error: 'Account not found.' });
+      }
+      console.error('Unable to update profile:', error);
+      return res.status(503).json({ success: false, error: 'Profile service is temporarily unavailable.' });
+    }
+  });
+
+  // Raw body, not multipart: it avoids a multer dependency and the 33% base64 overhead.
+  const avatarBodyParser = express.raw({ type: ['image/png', 'image/jpeg', 'image/gif'], limit: '1mb' });
+
+  app.post('/api/users/me/avatar', avatarBodyParser, async (req, res) => {
+    const authReq = req as AuthRequest;
+    if (!authReq.user) return res.status(401).json({ success: false, error: 'Not authenticated.' });
+
+    const body: unknown = req.body;
+    if (!Buffer.isBuffer(body) || body.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Send the image as the request body with an image/png, image/jpeg, or image/gif content type.',
+      });
+    }
+    if (body.length > MAX_AVATAR_BYTES) {
+      return res.status(413).json({ success: false, error: 'Images must be 800KB or smaller.' });
+    }
+
+    const extension = detectAvatarExtension(body);
+    if (!extension) {
+      return res.status(400).json({ success: false, error: 'Only PNG, JPEG, or GIF images are supported.' });
+    }
+
+    try {
+      await fsp.mkdir(AVATAR_DIR, { recursive: true });
+      const fileName = `${authReq.user.sub}-${Date.now()}.${extension}`;
+      await fsp.writeFile(path.join(AVATAR_DIR, fileName), body);
+
+      const previous = await prisma.user.findUnique({
+        where: { id: authReq.user.sub },
+        select: { avatarUrl: true },
+      });
+      const updated = await prisma.user.update({
+        where: { id: authReq.user.sub },
+        data: { avatarUrl: `/uploads/avatars/${fileName}` },
+      });
+
+      // Remove the replaced file so repeated uploads do not pile up on disk.
+      if (previous?.avatarUrl) {
+        const previousFileName = path.basename(previous.avatarUrl);
+        if (previousFileName !== fileName) {
+          await fsp.unlink(path.join(AVATAR_DIR, previousFileName)).catch(() => undefined);
+        }
+      }
+
+      return res.json({ success: true, user: serializeAccount({ ...updated, phone: updated.phone ?? undefined }) });
+    } catch (error) {
+      console.error('Unable to store avatar:', error);
+      return res.status(503).json({ success: false, error: 'Avatar upload is temporarily unavailable.' });
+    }
   });
 
   app.post('/api/tenant-invitations', inviteCreateLimiter, requireRole('landlord'), async (req, res) => {

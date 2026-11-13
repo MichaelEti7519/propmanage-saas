@@ -72,6 +72,7 @@ model User {
   passwordHash  String
   role          UserRole
   phone         String?
+  avatarUrl     String?
   emailVerificationStatus VerificationStatus @default(pending)
   phoneVerificationStatus VerificationStatus @default(not_started)
   identityVerificationStatus VerificationStatus @default(not_started)

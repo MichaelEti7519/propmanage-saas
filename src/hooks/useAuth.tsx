@@ -6,6 +6,8 @@ export interface AuthUser {
   lastName: string;
   email: string;
   role: 'tenant' | 'landlord' | 'admin';
+  phone?: string | null;
+  avatarUrl?: string | null;
 }
 
 interface AuthContextValue {
@@ -14,6 +16,7 @@ interface AuthContextValue {
   initializing: boolean;
   login: (user: AuthUser, token: string) => void;
   logout: () => void;
+  updateUser: (patch: Partial<AuthUser>) => void;
   fetchWithAuth: (input: RequestInfo, init?: RequestInit) => Promise<Response>;
 }
 
@@ -61,6 +64,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setToken(newToken);
   }, []);
 
+  // Merge edited profile fields into the session so avatars and names update everywhere
+  // without a re-login. The stored copy keeps the refresh path showing the latest values.
+  const updateUser = React.useCallback((patch: Partial<AuthUser>) => {
+    setUser((current) => {
+      if (!current) return current;
+      const next = { ...current, ...patch };
+      localStorage.setItem(AUTH_USER_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
   const fetchWithAuth = React.useCallback(
     async (input: RequestInfo, init: RequestInit = {}) => {
       const authToken = token || getStoredToken();
@@ -101,7 +115,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         const data = await response.json();
         if (data?.success && data?.user) {
-          setUser(data.user as AuthUser);
+          const refreshedUser = data.user as AuthUser;
+          localStorage.setItem(AUTH_USER_KEY, JSON.stringify(refreshedUser));
+          setUser(refreshedUser);
           setToken(storedToken);
         } else {
           logout();
@@ -117,7 +133,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [logout]);
 
   return (
-    <AuthContext.Provider value={{ user, token, initializing, login, logout, fetchWithAuth }}>
+    <AuthContext.Provider value={{ user, token, initializing, login, logout, updateUser, fetchWithAuth }}>
       {children}
     </AuthContext.Provider>
   );

@@ -63,3 +63,39 @@ body {
 	background: var(--color-ivory);
 	color: var(--color-espresso);
 }
+
+.hide-scrollbar {
+	scrollbar-width: none;
+	-ms-overflow-style: none;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+	display: none;
+}
+
+/* Capability strip under the hero. Duplicated content scrolls seamlessly; hovering
+   or tabbing into it pauses the motion so the text stays readable. */
+@keyframes marquee-scroll {
+	from {
+		transform: translate3d(0, 0, 0);
+	}
+	to {
+		transform: translate3d(-50%, 0, 0);
+	}
+}
+
+.marquee-track {
+	animation: marquee-scroll 42s linear infinite;
+}
+
+.marquee:hover .marquee-track,
+.marquee:focus-within .marquee-track {
+	animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.marquee-track {
+		animation: none;
+		transform: none;
+	}
+}

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { User, Lock, Bell, Shield, Save, Moon, Sun, Monitor } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useDarkMode } from '../../hooks/useDarkMode';
+import { ProfileSettings } from '../../components/ProfileSettings';
 
 export const TenantSettings = () => {
   const [activeTab, setActiveTab] = useState('profile');
@@ -63,48 +64,7 @@ export const TenantSettings = () => {
 
           {/* Content */}
           <div className="flex-1 bg-white dark:bg-slate-950 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm p-6 sm:p-8 transition-colors duration-200">
-            {activeTab === 'profile' && (
-              <div className="space-y-6 animate-in fade-in duration-200">
-                <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100 border-b border-slate-100 dark:border-slate-800 pb-4">Personal Information</h3>
-                
-                <div className="flex items-center gap-6 mb-6">
-                  <div className="w-20 h-20 rounded-full bg-indigo-100 dark:bg-indigo-900/50 flex items-center justify-center text-indigo-600 dark:text-indigo-400 font-bold text-2xl">
-                    JD
-                  </div>
-                  <div>
-                    <button className="px-4 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-sm font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
-                      Change Avatar
-                    </button>
-                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">JPG, GIF or PNG. Max size of 800K</p>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div>
-                    <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5">First Name</label>
-                    <input type="text" defaultValue="Jane" className="w-full px-4 py-2 border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm dark:bg-slate-900 dark:text-slate-100" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5">Last Name</label>
-                    <input type="text" defaultValue="Doe" className="w-full px-4 py-2 border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm dark:bg-slate-900 dark:text-slate-100" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5">Email Address</label>
-                    <input type="email" defaultValue="jane.doe@example.com" className="w-full px-4 py-2 border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm dark:bg-slate-900 dark:text-slate-100" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5">Phone Number</label>
-                    <input type="tel" defaultValue="(555) 123-4567" className="w-full px-4 py-2 border border-slate-200 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm dark:bg-slate-900 dark:text-slate-100" />
-                  </div>
-                </div>
-
-                <div className="pt-4 flex justify-end">
-                  <button className="flex items-center gap-2 px-5 py-2.5 bg-indigo-600 text-white rounded-xl font-medium hover:bg-indigo-700 transition-colors shadow-sm">
-                    <Save className="w-4 h-4" /> Save Changes
-                  </button>
-                </div>
-              </div>
-            )}
+            {activeTab === 'profile' && <ProfileSettings />}
 
             {activeTab === 'security' && (
               <div className="space-y-6 animate-in fade-in duration-200">
