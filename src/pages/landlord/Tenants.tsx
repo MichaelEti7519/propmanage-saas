@@ -1,9 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { 
-  Users, Building, FileText, Settings, Bell, Search, 
-  Menu, ShieldCheck, ShieldAlert, Shield, 
-  Activity, CheckCircle2, ChevronRight, X, AlertCircle, FileDigit,
-  Clock, CreditCard, Wrench, Copy, Mail
+import {
+  FileText, Bell, Shield, Activity, CheckCircle2, ChevronRight, X, CreditCard, Wrench, Copy, Mail,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useAuth } from '../../hooks/useAuth';
@@ -24,8 +21,6 @@ interface LandlordTenant {
   status: string;
   unit: string;
   appliedDate: string;
-  screeningStatus: string;
-  screeningReport: any;
   leaseEnd?: string;
   rentAmount: number;
   leaseStatus?: string;
@@ -41,12 +36,6 @@ export function LandlordTenants() {
   const [isLoadingTenants, setIsLoadingTenants] = useState(true);
   const [tenantLoadError, setTenantLoadError] = useState<string | null>(null);
   
-  // Screening Workflow State
-  const [isScreening, setIsScreening] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [screeningOptions, setScreeningOptions] = useState({ credit: true, background: true, eviction: true });
-  const [consentRequested, setConsentRequested] = useState(false);
-
   // Lease Renewal Workflow State
   const [isRenewingLease, setIsRenewingLease] = useState(false);
   const [renewalData, setRenewalData] = useState({ term: '12 Months', rentAmount: '', noticeSent: false });
@@ -58,6 +47,8 @@ export function LandlordTenants() {
   const [inviteResult, setInviteResult] = useState<{ email: string; emailSent: boolean; inviteUrl: string; expiresAt: number } | null>(null);
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [isEditingTenant, setIsEditingTenant] = useState(false);
+  const [isSavingTenant, setIsSavingTenant] = useState(false);
+  const [editTenantError, setEditTenantError] = useState<string | null>(null);
   const [editTenantData, setEditTenantData] = useState({ firstName: '', lastName: '', email: '', unit: '' });
   
   const [newTenantData, setNewTenantData] = useState({
@@ -101,8 +92,6 @@ export function LandlordTenants() {
             status: tenant.status,
             unit: unit ? `${propertiesById.get(unit.propertyId) || 'Property'} - Unit ${unit.number}` : 'Unassigned',
             appliedDate: tenant.leaseStart || today,
-            screeningStatus: 'none',
-            screeningReport: null,
             leaseEnd: tenant.leaseEnd,
             rentAmount: tenant.rent,
             leaseStatus: daysUntilLeaseEnd <= 60 && daysUntilLeaseEnd >= 0 ? 'Expiring Soon' : tenant.leaseEnd ? 'Active' : undefined,
@@ -165,112 +154,47 @@ export function LandlordTenants() {
     }
   };
 
-  const handleEditTenant = () => {
-    if (!editTenantData.firstName || !editTenantData.lastName || !editTenantData.email) return;
-    
-    setTenants(prev => prev.map(t => {
-      if (selectedTenant && t.id === selectedTenant.id) {
-        const updated = {
-          ...t,
+  const handleEditTenant = async () => {
+    if (!selectedTenant) return;
+    if (!editTenantData.firstName || !editTenantData.lastName || !editTenantData.email) {
+      setEditTenantError('First name, last name, and email are required.');
+      return;
+    }
+
+    setEditTenantError(null);
+    setIsSavingTenant(true);
+    try {
+      const response = await fetchWithAuth(`/api/tenants/${selectedTenant.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
           firstName: editTenantData.firstName,
           lastName: editTenantData.lastName,
           email: editTenantData.email,
-          unit: editTenantData.unit
-        };
-        setSelectedTenant(updated);
-        return updated;
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Unable to save tenant changes.');
       }
-      return t;
-    }));
-    setIsEditingTenant(false);
+
+      // The unit assignment is managed through move-in and vacate, so it is not sent here.
+      setTenants(prev => prev.map(t => (
+        t.id === selectedTenant.id
+          ? { ...t, firstName: editTenantData.firstName, lastName: editTenantData.lastName, email: editTenantData.email }
+          : t
+      )));
+      setSelectedTenant(prev => prev
+        ? { ...prev, firstName: editTenantData.firstName, lastName: editTenantData.lastName, email: editTenantData.email }
+        : null);
+      setIsEditingTenant(false);
+    } catch (err) {
+      setEditTenantError(err instanceof Error ? err.message : 'Unable to save tenant changes.');
+    } finally {
+      setIsSavingTenant(false);
+    }
   };
 
   const filteredTenants = tenants.filter(t => filterStatus === 'All' || t.status === filterStatus);
-
-  const getScreeningBadge = (tenant: any) => {
-    if (tenant.screeningStatus === 'completed') {
-      if (tenant.screeningReport?.recommendation === 'Approve') {
-        return (
-          <div className="flex items-center gap-1.5 font-medium text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200 w-fit">
-            <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-            <span className="text-xs">Approve</span>
-          </div>
-        );
-      }
-      if (tenant.screeningReport?.recommendation === 'Review') {
-        return (
-          <div className="flex items-center gap-1.5 font-medium text-amber-700 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-200 w-fit">
-            <AlertCircle className="w-4 h-4 text-amber-600" />
-            <span className="text-xs">Review</span>
-          </div>
-        );
-      }
-      if (tenant.screeningReport?.recommendation === 'Decline') {
-        return (
-          <div className="flex items-center gap-1.5 font-medium text-red-700 bg-red-50 px-2.5 py-1 rounded-md border border-red-200 w-fit">
-            <ShieldAlert className="w-4 h-4 text-red-600" />
-            <span className="text-xs">Decline</span>
-          </div>
-        );
-      }
-      return (
-        <div className="flex items-center gap-1.5 font-medium text-indigo-700 bg-indigo-50 px-2.5 py-1 rounded-md border border-indigo-200 w-fit">
-          <ShieldCheck className="w-4 h-4 text-indigo-600" />
-          <span className="text-xs">Completed</span>
-        </div>
-      );
-    }
-    return (
-      <div className="flex items-center gap-1.5 font-medium text-slate-600 bg-slate-100 px-2.5 py-1 rounded-md border border-slate-200 w-fit">
-        <Shield className="w-4 h-4 text-slate-500" />
-        <span className="text-xs">Pending</span>
-      </div>
-    );
-  };
-
-  const runScreening = async (tenantId: string) => {
-    setIsScreening(true);
-    setError(null);
-    try {
-      const tenant = tenants.find(t => t.id === tenantId);
-      if (!tenant) throw new Error("Tenant not found");
-
-      const response = await fetch('/api/screen-tenant', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          tenantId,
-          firstName: tenant.firstName,
-          lastName: tenant.lastName,
-          email: tenant.email
-        })
-      });
-
-      let data;
-      try {
-        data = await response.json();
-      } catch (err) {
-        throw new Error("Invalid response from server. Please try again later.");
-      }
-
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || "Failed to communicate with the screening service. Please check your connection and try again.");
-      }
-      
-      setTenants(prev => prev.map(t => 
-        t.id === tenantId ? { ...t, screeningStatus: 'completed', screeningReport: data.report } : t
-      ));
-      
-      if (selectedTenant && selectedTenant.id === tenantId) {
-        setSelectedTenant(prev => prev ? { ...prev, screeningStatus: 'completed', screeningReport: data.report } : null);
-      }
-      
-    } catch (err: any) {
-      setError(err.message || "An error occurred during screening.");
-    } finally {
-      setIsScreening(false);
-    }
-  };
 
   return (
     <div className="flex-1 overflow-auto p-4 sm:p-8 relative h-full">
@@ -348,13 +272,12 @@ export function LandlordTenants() {
                   <th className="px-6 py-4 whitespace-nowrap">Unit</th>
                   <th className="px-6 py-4 whitespace-nowrap">Status</th>
                   <th className="px-6 py-4 whitespace-nowrap">Applied</th>
-                  <th className="px-6 py-4 whitespace-nowrap">Screening</th>
                   <th className="px-6 py-4 text-right whitespace-nowrap">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 text-sm">
                 {filteredTenants.map((tenant) => (
-                  <tr key={tenant.id} className="hover:bg-slate-50/50 transition-colors group cursor-pointer" onClick={() => { setSelectedTenant(tenant); setIsEditingTenant(false); setIsRenewingLease(false); setConsentRequested(false); }}>
+                  <tr key={tenant.id} className="hover:bg-slate-50/50 transition-colors group cursor-pointer" onClick={() => { setSelectedTenant(tenant); setIsEditingTenant(false); setIsRenewingLease(false); }}>
                     <td className="px-6 py-4">
                       <div className="font-medium text-slate-900">{tenant.firstName} {tenant.lastName}</div>
                       <div className="text-slate-500 text-xs mt-0.5">{tenant.email}</div>
@@ -369,9 +292,6 @@ export function LandlordTenants() {
                       </span>
                     </td>
                     <td className="px-6 py-4 text-slate-500 whitespace-nowrap">{new Date(tenant.appliedDate).toLocaleDateString()}</td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      {getScreeningBadge(tenant)}
-                    </td>
                     <td className="px-6 py-4 text-right">
                       <button 
                         className="text-indigo-600 hover:text-indigo-900 font-medium text-xs flex items-center justify-end w-full gap-1 tracking-wide whitespace-nowrap"
@@ -380,7 +300,6 @@ export function LandlordTenants() {
                           setSelectedTenant(tenant);
                           setIsEditingTenant(false);
                           setIsRenewingLease(false);
-                          setConsentRequested(false);
                         }}
                       >
                         View Details <ChevronRight className="w-3.5 h-3.5" />
@@ -399,7 +318,6 @@ export function LandlordTenants() {
                 setSelectedTenant(tenant); 
                 setIsEditingTenant(false); 
                 setIsRenewingLease(false); 
-                setConsentRequested(false); 
               }}>
                 <div className="flex justify-between items-start mb-2">
                   <div>
@@ -423,8 +341,7 @@ export function LandlordTenants() {
                     <span className="text-slate-700 font-medium">{new Date(tenant.appliedDate).toLocaleDateString()}</span>
                   </div>
                 </div>
-                <div className="flex justify-between items-center pt-3 border-t border-slate-100 mt-1">
-                   {getScreeningBadge(tenant)}
+                <div className="flex justify-end items-center pt-3 border-t border-slate-100 mt-1">
                    <button className="text-indigo-600 font-medium text-xs flex items-center gap-1">
                      View Details <ChevronRight className="w-3.5 h-3.5" />
                    </button>
@@ -531,6 +448,7 @@ export function LandlordTenants() {
                         email: selectedTenant.email,
                         unit: selectedTenant.unit
                       });
+                      setEditTenantError(null);
                       setIsEditingTenant(true);
                     }}
                     className="p-2 text-indigo-600 hover:text-indigo-700 hover:bg-indigo-50 rounded-full transition-colors text-sm font-medium pr-3"
@@ -651,25 +569,31 @@ export function LandlordTenants() {
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-slate-700 mb-1">Unit</label>
-                    <input 
-                      type="text" 
+                    <input
+                      type="text"
                       value={editTenantData.unit}
-                      onChange={e => setEditTenantData({...editTenantData, unit: e.target.value})}
-                      className="w-full px-3 py-2 border border-slate-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm" 
+                      readOnly
+                      disabled
+                      className="w-full px-3 py-2 border border-slate-200 rounded-lg bg-slate-50 text-slate-500 text-sm"
                     />
+                    <p className="mt-1 text-xs text-slate-500">Assignments change when a tenant moves in or is removed.</p>
                   </div>
+                  {editTenantError && (
+                    <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{editTenantError}</p>
+                  )}
                   <div className="flex gap-3 pt-4 border-t border-slate-100">
                     <button 
-                      onClick={() => setIsEditingTenant(false)}
+                      onClick={() => { setIsEditingTenant(false); setEditTenantError(null); }}
                       className="flex-1 px-4 py-2 bg-white border border-slate-200 text-slate-700 rounded-lg text-sm font-medium hover:bg-slate-50 transition-colors"
                     >
                       Cancel
                     </button>
                     <button 
                       onClick={handleEditTenant}
-                      className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium shadow-sm transition-colors"
+                      disabled={isSavingTenant}
+                      className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      Save Changes
+                      {isSavingTenant ? 'Saving...' : 'Save Changes'}
                     </button>
                   </div>
                 </div>
@@ -697,178 +621,25 @@ export function LandlordTenants() {
                     </div>
                   </div>
 
-                  {/* Screening Section */}
-                  <div className="space-y-4">
-                    <h3 className="text-xl font-bold text-slate-900 flex items-center gap-2">
-                      Background Screening
-                    </h3>
-                    
-                    {selectedTenant.screeningStatus === 'completed' && selectedTenant.screeningReport ? (
-                      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-                        <div className="bg-slate-50 px-5 sm:px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:justify-between items-start sm:items-center gap-2 sm:gap-0">
-                          <div className="flex items-center gap-2">
-                            <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/c/cd/TransUnion_logo.svg/512px-TransUnion_logo.svg.png" alt="TransUnion" className="h-4 opacity-70 grayscale" />
-                            <span className="text-xs font-semibold text-slate-500 uppercase tracking-widest ml-2 px-2 py-0.5 bg-slate-200/50 rounded">Verified</span>
-                          </div>
-                          <span className="text-sm font-medium text-slate-500">
-                            {new Date(selectedTenant.screeningReport.dateCompleted).toLocaleDateString()}
-                          </span>
-                        </div>
-                        
-                        <div className="p-6 sm:p-8">
-                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-6 mb-8">
-                             <div className="flex flex-col gap-2">
-                               <span className="text-sm font-medium text-slate-500 mb-1">Recommendation</span>
-                               <span className={cn(
-                                 "text-lg sm:text-xl font-bold flex items-center gap-2.5 px-4 py-2 rounded-xl border w-fit shadow-sm",
-                                 selectedTenant.screeningReport.recommendation === 'Approve' ? "text-emerald-700 bg-emerald-50 border-emerald-200" : 
-                                 selectedTenant.screeningReport.recommendation === 'Review' ? "text-amber-700 bg-amber-50 border-amber-200" : "text-red-700 bg-red-50 border-red-200"
-                               )}>
-                                 {selectedTenant.screeningReport.recommendation === 'Approve' && <CheckCircle2 className="w-6 h-6 text-emerald-600" />}
-                                 {selectedTenant.screeningReport.recommendation === 'Review' && <AlertCircle className="w-6 h-6 text-amber-600" />}
-                                 {selectedTenant.screeningReport.recommendation === 'Decline' && <ShieldAlert className="w-6 h-6 text-red-600" />}
-                                 {selectedTenant.screeningReport.recommendation}
-                               </span>
-                             </div>
-                             
-                             <div className="sm:text-right">
-                               <span className="text-sm font-medium text-slate-500 mb-2 block">Credit Score</span>
-                               <span className="text-4xl font-black text-slate-900 tracking-tight">
-                                 {selectedTenant.screeningReport.creditScore}
-                               </span>
-                             </div>
-                          </div>
-
-                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6 pt-6 border-t border-slate-100">
-                            <div className="bg-slate-50 p-4 rounded-xl border border-slate-100 flex flex-col justify-center">
-                              <span className="block text-xs uppercase tracking-wider text-slate-500 mb-2 font-semibold">Criminal Records</span>
-                              <span className={cn("text-lg font-bold", selectedTenant.screeningReport.criminalRecords === 0 ? "text-emerald-600" : "text-red-600")}>
-                                {selectedTenant.screeningReport.criminalRecords === 0 ? "0 Found" : `${selectedTenant.screeningReport.criminalRecords} Found`}
-                              </span>
-                            </div>
-                            <div className="bg-slate-50 p-4 rounded-xl border border-slate-100 flex flex-col justify-center">
-                              <span className="block text-xs uppercase tracking-wider text-slate-500 mb-2 font-semibold">Eviction History</span>
-                              <span className={cn("text-lg font-bold", selectedTenant.screeningReport.evictionHistory === 0 ? "text-emerald-600" : "text-red-600")}>
-                                 {selectedTenant.screeningReport.evictionHistory === 0 ? "0 Found" : `${selectedTenant.screeningReport.evictionHistory} Found`}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-                        <div className="bg-slate-50 px-6 sm:px-8 py-4 border-t border-slate-200">
-                          <button className="text-sm font-semibold text-indigo-600 hover:text-indigo-800 transition-colors w-full text-center flex items-center justify-center gap-2">
-                            Download Full Report (PDF)
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="bg-slate-50 rounded-2xl border border-slate-200 text-left flex flex-col overflow-hidden">
-                        <div className="p-6 sm:p-8 bg-white border-b border-slate-100">
-                          <h5 className="font-bold text-slate-900 mb-2 text-lg">
-                            Configure Screening
-                          </h5>
-                          <p className="text-sm text-slate-500 mb-6 max-w-md">
-                            Select the reports you need. The tenant will receive an email to consent and provide any required information.
-                          </p>
-                          
-                          <div className="space-y-3 mb-8">
-                            <label className="flex flex-row items-center justify-between p-4 rounded-xl border border-slate-200 cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/30 transition-all">
-                              <div className="flex items-center gap-3">
-                                <input type="checkbox" checked={screeningOptions.credit} onChange={e => setScreeningOptions({...screeningOptions, credit: e.target.checked})} className="w-5 h-5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-600" />
-                                <div>
-                                  <span className="block font-semibold text-slate-900">Credit Check</span>
-                                  <span className="block text-xs text-slate-500 mt-0.5">Full credit report with ResidentScore</span>
-                                </div>
-                              </div>
-                              <span className="font-medium text-slate-700">$15.00</span>
-                            </label>
-                            
-                            <label className="flex flex-row items-center justify-between p-4 rounded-xl border border-slate-200 cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/30 transition-all">
-                              <div className="flex items-center gap-3">
-                                <input type="checkbox" checked={screeningOptions.background} onChange={e => setScreeningOptions({...screeningOptions, background: e.target.checked})} className="w-5 h-5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-600" />
-                                <div>
-                                  <span className="block font-semibold text-slate-900">Background Check</span>
-                                  <span className="block text-xs text-slate-500 mt-0.5">National criminal & sex offender search</span>
-                                </div>
-                              </div>
-                              <span className="font-medium text-slate-700">$15.00</span>
-                            </label>
-                            
-                            <label className="flex flex-row items-center justify-between p-4 rounded-xl border border-slate-200 cursor-pointer hover:border-indigo-300 hover:bg-indigo-50/30 transition-all">
-                              <div className="flex items-center gap-3">
-                                <input type="checkbox" checked={screeningOptions.eviction} onChange={e => setScreeningOptions({...screeningOptions, eviction: e.target.checked})} className="w-5 h-5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-600" />
-                                <div>
-                                  <span className="block font-semibold text-slate-900">Eviction History</span>
-                                  <span className="block text-xs text-slate-500 mt-0.5">National eviction records search</span>
-                                </div>
-                              </div>
-                              <span className="font-medium text-slate-700">$10.00</span>
-                            </label>
-                          </div>
-                          
-                          <div className="flex justify-between items-center bg-slate-50 p-4 rounded-xl">
-                            <span className="font-medium text-slate-600">Total Applicant Fee</span>
-                            <span className="font-bold text-slate-900 text-xl">
-                              ${(screeningOptions.credit ? 15 : 0) + (screeningOptions.background ? 15 : 0) + (screeningOptions.eviction ? 10 : 0)}.00
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="p-6 bg-slate-50">
-                          {error && (
-                            <div className="mb-5 text-sm text-red-700 bg-red-50 p-4 rounded-lg w-full text-left flex gap-3 items-start border border-red-100 shadow-sm relative overflow-hidden">
-                               <div className="absolute left-0 top-0 bottom-0 w-1 bg-red-400"></div>
-                               <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5 text-red-500" />
-                               <div className="flex flex-col">
-                                 <span className="font-semibold text-red-800 mb-0.5">Screening Failed</span>
-                                 <span className="text-red-600/90 leading-snug">{error}</span>
-                               </div>
-                            </div>
-                          )}
-
-                          {!consentRequested ? (
-                            <button 
-                              onClick={() => setConsentRequested(true)}
-                              className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold shadow-sm transition-colors flex items-center justify-center gap-2"
-                            >
-                              <ShieldCheck className="w-4 h-4" />
-                              Request Tenant Consent
-                            </button>
-                          ) : (
-                            <div className="flex flex-col gap-4">
-                              <div className="flex items-center gap-3 bg-amber-50 text-amber-800 p-4 rounded-xl border border-amber-200">
-                                <div className="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></div>
-                                <span className="font-medium text-sm">Waiting for applicant consent...</span>
-                              </div>
-                              <button 
-                                onClick={() => runScreening(selectedTenant.id)}
-                                disabled={isScreening}
-                                className={cn(
-                                  "w-full py-3 rounded-xl text-sm font-semibold transition-all shadow-sm flex items-center justify-center gap-2",
-                                  isScreening 
-                                    ? "bg-slate-200 text-slate-500 cursor-not-allowed" 
-                                    : "bg-white border border-slate-300 hover:bg-slate-50 text-slate-700"
-                                )}
-                              >
-                                {isScreening ? (
-                                  <>
-                                    <div className="w-4 h-4 border-2 border-slate-400 border-t-slate-600 rounded-full animate-spin"></div>
-                                    Processing Report...
-                                  </>
-                                ) : (
-                                  "Override & Run Screening (Demo)"
-                                )}
-                              </button>
-                            </div>
-                          )}
-                          <p className="text-[10px] sm:text-xs text-slate-500 mt-4 text-center leading-relaxed">
-                            Screening must comply with FCRA guidelines. By proceeding, you agree to the Terms of Service.
-                          </p>
-                        </div>
-                      </div>
-                    )}
+                  {/* Screening has no provider behind it yet. Saying so plainly is the only
+                      honest state: no score, no badge, and no report can appear until a real
+                      provider returns one. */}
+                  <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
+                    <h3 className="text-xl font-bold text-slate-900">Background Screening</h3>
+                    <p className="mt-2 max-w-xl text-sm text-slate-600">
+                      Screening is not connected in this workspace yet. No screening provider agreement is in place,
+                      so no credit, criminal, or eviction report can be requested here, and no result is displayed.
+                    </p>
+                    <div className="mt-5 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                      <Shield className="mt-0.5 h-4 w-4 flex-shrink-0 text-slate-400" />
+                      <p className="text-xs leading-relaxed text-slate-600">
+                        When a provider is connected, the applicant consents first and the report is returned by the
+                        provider under their terms. PropManage will keep only the provider reference, the outcome, and
+                        the timestamp.
+                      </p>
+                    </div>
                   </div>
-                  
-                   <div className="space-y-4">
+                  <div className="space-y-4">
                     <h3 className="text-xl font-bold text-slate-900">
                       Application Details
                     </h3>

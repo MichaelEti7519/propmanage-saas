@@ -90,6 +90,8 @@ model User {
   invitations   TenantInvitation[] @relation("InvitationLandlord")
   reportsFiled  Report[]          @relation("ReportReporter")
   reportsReviewed Report[]        @relation("ReportReviewer")
+  messagesSent  Message[]         @relation("MessageSender")
+  messagesReceived Message[]      @relation("MessageRecipient")
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
 }
@@ -262,14 +264,19 @@ model MaintenanceRequest {
 }
 
 model Message {
-  id        String   @id @default(cuid())
-  sender    String
-  recipient String
-  subject   String
-  body      String
-  read      Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String   @id @default(cuid())
+  senderId    String
+  sender      User     @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  recipientId String
+  recipient   User     @relation("MessageRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  subject     String
+  body        String
+  read        Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([recipientId, read, createdAt])
+  @@index([senderId, createdAt])
 }
 
 model Document {

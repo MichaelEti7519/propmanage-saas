@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { FileText, Search, Filter, Calendar, FileDigit, Upload, Sparkles, Loader2, ShieldCheck } from 'lucide-react';
+import { FileText, Search, Filter, Calendar, FileDigit, Upload, Loader2, ShieldCheck, Tag } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useAuth } from '../../hooks/useAuth';
 import GlideSelect, { type GlideSelectOption } from '../../components/GlideSelect';
@@ -20,7 +20,7 @@ export const TenantDocuments = () => {
   const [filterType, setFilterType] = useState('All');
   const [sortBy, setSortBy] = useState('newest');
   const [selectedType, setSelectedType] = useState('');
-  const [privacyConfirmed, setPrivacyConfirmed] = useState(false);
+  const [documentDate, setDocumentDate] = useState(() => new Date().toISOString().split('T')[0]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
@@ -96,8 +96,8 @@ export const TenantDocuments = () => {
       event.target.value = '';
       return;
     }
-    if (!privacyConfirmed) {
-      setUploadError('Confirm the document privacy notice before uploading.');
+    if (!documentDate || Number.isNaN(Date.parse(documentDate))) {
+      setUploadError('Choose the date shown on the document.');
       event.target.value = '';
       return;
     }
@@ -121,53 +121,28 @@ export const TenantDocuments = () => {
       return;
     }
 
+    // The file is inspected in the browser only. Its name and size are recorded; the
+    // contents are never read, uploaded, or sent to any third party.
     setIsUploading(true);
     try {
-      const base64Data = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => typeof reader.result === 'string'
-          ? resolve(reader.result)
-          : reject(new Error('Could not read the selected file.'));
-        reader.onerror = () => reject(new Error('Could not read the selected file.'));
-        reader.readAsDataURL(file);
-      });
-
-      const response = await fetchWithAuth('/api/scan-document', {
-        method: 'POST',
-        body: JSON.stringify({
-          fileName: file.name,
-          documentType: selectedType,
-          mimeType: expectedMime,
-          base64Data,
-        }),
-      });
-      const result = await response.json() as {
-        success?: boolean;
-        data?: { primaryDate?: string; extractedDates?: string[] };
-        error?: string;
-      };
-      if (!response.ok || !result.success || !result.data) {
-        throw new Error(result.error || 'Could not analyze the selected document.');
-      }
-
-      const persistedResponse = await fetchWithAuth('/api/documents', {
+      const response = await fetchWithAuth('/api/documents', {
         method: 'POST',
         body: JSON.stringify({
           name: file.name,
           type: selectedType,
-          date: result.data.primaryDate || new Date().toISOString().split('T')[0],
+          date: documentDate,
           size: formatSize(file.size),
-          tags: result.data.extractedDates || [],
+          tags: [],
         }),
       });
-      const persisted = await persistedResponse.json() as { success?: boolean; data?: DocumentRecord; error?: string };
-      if (!persistedResponse.ok || !persisted.success || !persisted.data) {
-        throw new Error(persisted.error || 'Could not save document details.');
+      const result = await response.json() as { success?: boolean; data?: DocumentRecord; error?: string };
+      if (!response.ok || !result.success || !result.data) {
+        throw new Error(result.error || 'Could not save document details.');
       }
 
-      setDocuments((current) => [persisted.data!, ...current]);
+      setDocuments((current) => [result.data!, ...current]);
     } catch (error) {
-      setUploadError(error instanceof Error ? error.message : 'Could not process the selected document.');
+      setUploadError(error instanceof Error ? error.message : 'Could not save document details.');
     } finally {
       setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -176,21 +151,16 @@ export const TenantDocuments = () => {
 
   return (
     <div className="p-4 sm:p-8 flex-1 overflow-y-auto mb-16 md:mb-0 bg-slate-50 relative">
-      {/* Loading Overlay */}
+      {/* Saving overlay */}
       {isUploading && (
-        <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="absolute inset-0 z-50 bg-white/80 flex items-center justify-center p-4">
            <div className="bg-white p-8 rounded-2xl shadow-xl border border-slate-100 max-w-sm w-full text-center flex flex-col items-center">
-              <div className="relative mb-6">
-                 <div className="w-16 h-16 bg-indigo-50 rounded-full flex items-center justify-center">
-                    <Sparkles className="w-8 h-8 text-indigo-600 animate-pulse" />
-                 </div>
-                 <div className="absolute -bottom-1 -right-1 bg-white rounded-full p-1 shadow-sm border border-slate-100">
-                    <Loader2 className="w-4 h-4 text-indigo-600 animate-spin" />
-                 </div>
+              <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-full bg-[#FAF8F3]">
+                 <Loader2 className="w-7 h-7 text-[#397451] animate-spin" />
               </div>
-              <h3 className="text-lg font-bold text-slate-900 mb-2">Analyzing Document...</h3>
+              <h3 className="text-lg font-bold text-slate-900 mb-2">Saving document details</h3>
               <p className="text-sm text-slate-500 leading-relaxed">
-                Our AI is scanning your document to determine its type and extract key metadata...
+                Only the name, type, date, and size are being recorded.
               </p>
            </div>
         </div>
@@ -203,9 +173,9 @@ export const TenantDocuments = () => {
             <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">Leases & Documents</h1>
             <p className="text-slate-500 mt-1">Keep document details organized without storing original files in PropManage.</p>
           </div>
-          <div className="grid w-full gap-3 sm:grid-cols-[minmax(220px,1fr)_auto] lg:max-w-2xl">
+          <div className="grid w-full gap-3 sm:grid-cols-[minmax(180px,1fr)_minmax(150px,auto)_auto] lg:max-w-3xl">
             <div>
-              <label className="mb-1.5 block text-xs font-semibold text-slate-700">Choose document type first</label>
+              <span className="mb-1.5 block text-xs font-semibold text-slate-700">Document type</span>
               <GlideSelect
                 options={documentTypeOptions}
                 value={selectedType}
@@ -214,11 +184,21 @@ export const TenantDocuments = () => {
                 ariaLabel="Document category"
               />
             </div>
+            <div>
+              <label htmlFor="document-date" className="mb-1.5 block text-xs font-semibold text-slate-700">Document date</label>
+              <input
+                id="document-date"
+                type="date"
+                value={documentDate}
+                onChange={(event) => setDocumentDate(event.target.value)}
+                className="flex min-h-11 w-full items-center border border-[#E8DDCC] bg-white px-3 text-sm text-[#332D29] focus:border-[#B9A58B] focus:outline-none"
+              />
+            </div>
             <div className="flex items-end">
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={!selectedType || !privacyConfirmed || isUploading}
+                disabled={!selectedType || isUploading}
                 className="flex min-h-11 w-full items-center justify-center gap-2 bg-[#332D29] px-5 text-sm font-semibold text-white transition-colors hover:bg-[#397451] disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
               >
                 <Upload className="h-4 w-4" />
@@ -229,7 +209,7 @@ export const TenantDocuments = () => {
                 ref={fileInputRef}
                 className="hidden"
                 accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
-                disabled={!selectedType || !privacyConfirmed || isUploading}
+                disabled={!selectedType || isUploading}
                 onChange={handleFileUpload}
               />
             </div>
@@ -239,12 +219,8 @@ export const TenantDocuments = () => {
         <div className="max-w-4xl border-l-2 border-[#B9A58B] bg-white px-4 py-3 text-sm text-slate-700">
           <div className="flex items-start gap-2">
             <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[#397451]" />
-            <p className="leading-6">PDF, JPEG, or PNG only, up to 8 MB. The file is sent to Google Gemini for date extraction and is not stored by PropManage; only document metadata is saved. Never upload IDs, deeds, bank statements, payslips, or files containing sensitive identity or financial details.</p>
+            <p className="leading-6">PDF, JPEG, or PNG up to 8 MB. The file stays on your device: PropManage reads only its name and size and stores the details you confirm here. Never record IDs, deeds, bank statements, payslips, or anything containing sensitive identity or financial details.</p>
           </div>
-          <label className="mt-3 flex cursor-pointer items-start gap-2 border-t border-slate-100 pt-3 text-xs leading-5 text-slate-600">
-            <input type="checkbox" checked={privacyConfirmed} onChange={(event) => setPrivacyConfirmed(event.target.checked)} className="mt-1 h-4 w-4 shrink-0 accent-[#397451]" />
-            <span>I understand the file is sent to Google Gemini for analysis and confirm it does not contain prohibited identity or financial documents.</span>
-          </label>
         </div>
 
         {(uploadError || loadError) && (
@@ -325,7 +301,7 @@ export const TenantDocuments = () => {
                         
                         {doc.tags && doc.tags.map((tag: string, i: number) => (
                           <span key={i} className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 text-[10px] font-medium flex items-center gap-1">
-                            <Sparkles className="w-2.5 h-2.5 text-indigo-400" />
+                            <Tag className="w-2.5 h-2.5 text-slate-400" />
                             {tag}
                           </span>
                         ))}

@@ -133,6 +133,15 @@ function mapDbUnit(unit: any): Unit {
   };
 }
 
+/**
+ * `Property.occupancy` is a cached count that dashboards read. Recompute it after any
+ * unit or tenant change instead of nudging the number up and down by hand.
+ */
+async function syncPropertyOccupancy(propertyId: string) {
+  const occupied = await prisma.unit.count({ where: { propertyId, status: 'occupied' } });
+  await prisma.property.update({ where: { id: propertyId }, data: { occupancy: occupied } });
+}
+
 function mapDbTenant(tenant: any): Tenant {
   return {
     id: tenant.id,
@@ -316,27 +325,6 @@ interface MaintenanceRequest {
   updatedAt: string;
 }
 
-interface Message {
-  id: string;
-  sender: string;
-  recipient: string;
-  subject: string;
-  body: string;
-  createdAt: string;
-  read: boolean;
-}
-
-interface Document {
-  id: string;
-  name: string;
-  type: string;
-  date: string;
-  size: string;
-  tags: string[];
-  ownerId?: string;
-  url?: string;
-}
-
 const now = new Date();
 const today = now.toISOString().split('T')[0];
 
@@ -388,16 +376,6 @@ const payments: Payment[] = [
 const maintenanceRequests: MaintenanceRequest[] = [
   { id: 'm1', propertyId: 'p1', unitId: 'u1', tenantId: 't3', title: 'HVAC not cooling', description: 'The air conditioning is blowing warm air all day.', status: 'open', priority: 'High', createdAt: '2026-06-10', updatedAt: '2026-06-10' },
   { id: 'm2', propertyId: 'p2', unitId: 'u3', tenantId: 't1', title: 'Leaky kitchen faucet', description: 'Faucet drips continuously after being turned off.', status: 'in_progress', priority: 'Medium', createdAt: '2026-06-05', updatedAt: '2026-06-12' },
-];
-
-const messages: Message[] = [
-  { id: 'msg1', sender: 'tenant:michael', recipient: 'landlord', subject: 'Maintenance request follow-up', body: 'Any update on the HVAC issue in Apt 1A?', createdAt: '2026-06-11T08:30:00Z', read: false },
-  { id: 'msg2', sender: 'landlord', recipient: 'tenant:john', subject: 'Upcoming inspection', body: 'Your unit will be inspected on June 20th.', createdAt: '2026-06-09T14:20:00Z', read: true },
-];
-
-const documents: Document[] = [
-  { id: 'd1', name: 'Lease_Agreement_2026-2027.pdf', type: 'Lease', date: '2026-01-15', size: '2.4 MB', tags: ['2026-02-01', '2027-01-31'], ownerId: undefined },
-  { id: 'd2', name: 'Rent_Receipt_June_2026.pdf', type: 'Receipt', date: '2026-06-01', size: '120 KB', tags: [], ownerId: undefined },
 ];
 
 function createId(prefix = 'id') {
@@ -965,6 +943,48 @@ async function startServer() {
     }
   });
 
+  // Changing a password always re-checks the current one, so a stolen session token
+  // alone cannot lock the real owner out of the account.
+  app.post('/api/users/me/password', async (req, res) => {
+    const authReq = req as AuthRequest;
+    if (!authReq.user) return res.status(401).json({ success: false, error: 'Not authenticated.' });
+
+    const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+    const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, error: 'Enter your current password and a new password.' });
+    }
+    if (!isStrongPassword(newPassword)) {
+      return res.status(400).json({ success: false, error: 'New password must be at least 12 characters.' });
+    }
+    if (currentPassword === newPassword) {
+      return res.status(400).json({ success: false, error: 'Choose a new password that is different from the current one.' });
+    }
+
+    try {
+      const account = await prisma.user.findUnique({
+        where: { id: authReq.user.sub },
+        select: { passwordHash: true },
+      });
+      if (!account) return res.status(404).json({ success: false, error: 'Account not found.' });
+
+      const matches = await bcrypt.compare(currentPassword, account.passwordHash);
+      if (!matches) {
+        return res.status(401).json({ success: false, error: 'Current password is incorrect.' });
+      }
+
+      await prisma.user.update({
+        where: { id: authReq.user.sub },
+        data: { passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) },
+      });
+      return res.json({ success: true, message: 'Password updated.' });
+    } catch (error) {
+      console.error('Unable to change password:', error);
+      return res.status(503).json({ success: false, error: 'Password service is temporarily unavailable.' });
+    }
+  });
+
   // Raw body, not multipart: it avoids a multer dependency and the 33% base64 overhead.
   const avatarBodyParser = express.raw({ type: ['image/png', 'image/jpeg', 'image/gif'], limit: '1mb' });
 
@@ -1280,39 +1300,268 @@ async function startServer() {
     return res.status(503).json({ success: false, error: 'Invitation service is temporarily unavailable.' });
   });
 
-  app.get('/api/dashboard-stats', async (_req, res) => {
-    const dbStats = await readDatabaseOrFallback(undefined, async () => {
-      const [propertyCount, unitCount, tenantCount, openMaintenance, pendingPayments] = await Promise.all([
+  // Every number here is scoped to the caller. A landlord never sees another
+  // landlord's totals, and a tenant only sees their own tenancy.
+  // Admin-only platform overview. Every figure is counted from a real table. The app has
+  // no subscription or billing model, so this reports rent totals and never invents SaaS
+  // revenue, uptime, or storage numbers.
+  app.get('/api/admin/overview', requireRole('admin'), async (_req, res) => {
+    try {
+      const [
+        propertyCount,
+        unitCount,
+        occupiedUnits,
+        landlordCount,
+        accountCount,
+        tenantCount,
+        activeTenantCount,
+        openMaintenance,
+        pendingPayments,
+        overduePayments,
+        openReports,
+        rentTotals,
+        recentProperties,
+        recentReports,
+        recentMaintenance,
+      ] = await Promise.all([
         prisma.property.count(),
         prisma.unit.count(),
+        prisma.unit.count({ where: { status: 'occupied' } }),
+        prisma.user.count({ where: { role: 'landlord' } }),
+        prisma.user.count(),
+        prisma.tenant.count(),
         prisma.tenant.count({ where: { status: 'Active' } }),
         prisma.maintenanceRequest.count({ where: { status: { not: 'closed' } } }),
         prisma.payment.count({ where: { status: 'pending' } }),
+        prisma.payment.count({ where: { status: 'overdue' } }),
+        prisma.report.count({ where: { status: 'open' } }),
+        prisma.payment.groupBy({ by: ['status'], _sum: { amount: true } }),
+        prisma.property.findMany({
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+          include: { landlord: { select: { firstName: true, lastName: true } } },
+        }),
+        prisma.report.findMany({
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+          select: { id: true, targetType: true, targetName: true, reason: true, status: true, riskBand: true, createdAt: true },
+        }),
+        prisma.maintenanceRequest.findMany({
+          where: { status: { not: 'closed' } },
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+          include: {
+            property: { select: { name: true } },
+            unit: { select: { number: true } },
+          },
+        }),
       ]);
 
-      return {
-        propertyCount,
-        unitCount,
-        tenantCount,
-        openMaintenance,
-        pendingPayments,
-      };
-    });
+      const rentByStatus = rentTotals.reduce<Record<string, number>>((totals, row) => {
+        totals[row.status] = row._sum.amount ?? 0;
+        return totals;
+      }, {});
 
-    if (dbStats !== undefined) {
-      return res.json({ success: true, data: dbStats });
+      return res.json({
+        success: true,
+        data: {
+          propertyCount,
+          unitCount,
+          occupiedUnits,
+          vacantUnits: unitCount - occupiedUnits,
+          occupancyRate: unitCount > 0 ? Math.round((occupiedUnits / unitCount) * 100) : 0,
+          landlordCount,
+          accountCount,
+          tenantCount,
+          activeTenantCount,
+          openMaintenance,
+          pendingPayments,
+          overduePayments,
+          openReports,
+          rentByStatus: {
+            paid: rentByStatus.paid ?? 0,
+            pending: rentByStatus.pending ?? 0,
+            overdue: rentByStatus.overdue ?? 0,
+          },
+          recentProperties: recentProperties.map((property) => ({
+            id: property.id,
+            name: property.name,
+            city: property.city,
+            state: property.state,
+            status: property.status,
+            landlordName: `${property.landlord.firstName} ${property.landlord.lastName}`.trim(),
+            createdAt: property.createdAt.toISOString(),
+          })),
+          recentReports: recentReports.map((report) => ({
+            ...report,
+            createdAt: report.createdAt.toISOString(),
+          })),
+          recentMaintenance: recentMaintenance.map((request) => ({
+            id: request.id,
+            title: request.title,
+            status: request.status,
+            priority: request.priority,
+            propertyName: request.property.name,
+            unitNumber: request.unit.number,
+            createdAt: request.createdAt.toISOString(),
+          })),
+        },
+      });
+    } catch (error) {
+      console.error('Unable to load admin overview:', error);
+      return res.status(503).json({ success: false, error: 'Platform overview is temporarily unavailable.' });
     }
+  });
 
-    return res.json({
-      success: true,
-      data: {
-        propertyCount: properties.length,
-        unitCount: units.length,
-        tenantCount: tenants.filter((t) => t.status === 'Active').length,
-        openMaintenance: maintenanceRequests.filter((m) => m.status !== 'closed').length,
-        pendingPayments: payments.filter((p) => p.status === 'pending').length,
-      },
-    });
+  // Admin-only account directory. Only identity and verification metadata is selected;
+  // password hashes and document contents are never sent to the client.
+  app.get('/api/admin/users', requireRole('admin'), async (_req, res) => {
+    try {
+      const [users, tenants, units, properties] = await Promise.all([
+        prisma.user.findMany({
+          orderBy: { createdAt: 'desc' },
+          take: 1000,
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: true,
+            phone: true,
+            trustScore: true,
+            blacklisted: true,
+            emailVerificationStatus: true,
+            identityVerificationStatus: true,
+            createdAt: true,
+          },
+        }),
+        prisma.tenant.findMany({ select: { userId: true, unitId: true, status: true, landlordId: true } }),
+        prisma.unit.findMany({ select: { id: true, number: true, propertyId: true } }),
+        prisma.property.findMany({ select: { id: true, name: true, landlordId: true } }),
+      ]);
+
+      const unitsById = new Map(units.map((unit) => [unit.id, unit]));
+      const propertiesById = new Map(properties.map((property) => [property.id, property]));
+      const usersById = new Map(users.map((user) => [user.id, user]));
+      const tenantByUserId = new Map<string, (typeof tenants)[number]>();
+      for (const tenant of tenants) {
+        if (tenant.userId && !tenantByUserId.has(tenant.userId)) tenantByUserId.set(tenant.userId, tenant);
+      }
+      const propertyCountByLandlord = properties.reduce<Record<string, number>>((counts, property) => {
+        counts[property.landlordId] = (counts[property.landlordId] ?? 0) + 1;
+        return counts;
+      }, {});
+
+      return res.json({
+        success: true,
+        data: users.map((user) => {
+          const tenant = tenantByUserId.get(user.id);
+          const unit = tenant?.unitId ? unitsById.get(tenant.unitId) : undefined;
+          const property = unit ? propertiesById.get(unit.propertyId) : undefined;
+          const landlord = tenant?.landlordId ? usersById.get(tenant.landlordId) : undefined;
+          return {
+            id: user.id,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            email: user.email,
+            role: user.role,
+            phone: user.phone,
+            trustScore: user.trustScore,
+            blacklisted: user.blacklisted,
+            emailVerificationStatus: user.emailVerificationStatus,
+            identityVerificationStatus: user.identityVerificationStatus,
+            createdAt: user.createdAt.toISOString(),
+            tenantStatus: tenant?.status ?? null,
+            unitNumber: unit?.number ?? null,
+            propertyName: property?.name ?? null,
+            landlordName: landlord ? `${landlord.firstName} ${landlord.lastName}`.trim() : null,
+            propertyCount: user.role === 'landlord' ? propertyCountByLandlord[user.id] ?? 0 : null,
+          };
+        }),
+      });
+    } catch (error) {
+      console.error('Unable to load admin accounts:', error);
+      return res.status(503).json({ success: false, error: 'The account directory is temporarily unavailable.' });
+    }
+  });
+
+  app.get('/api/dashboard-stats', async (req, res) => {
+    const user = (req as AuthRequest).user!;
+
+    try {
+      if (user.role === 'admin') {
+        const [propertyCount, unitCount, tenantCount, openMaintenance, pendingPayments] = await Promise.all([
+          prisma.property.count(),
+          prisma.unit.count(),
+          prisma.tenant.count({ where: { status: 'Active' } }),
+          prisma.maintenanceRequest.count({ where: { status: { not: 'closed' } } }),
+          prisma.payment.count({ where: { status: 'pending' } }),
+        ]);
+
+        return res.json({
+          success: true,
+          data: { propertyCount, unitCount, tenantCount, openMaintenance, pendingPayments },
+        });
+      }
+
+      if (user.role === 'landlord') {
+        const ownedProperties = await prisma.property.findMany({
+          where: { landlordId: user.sub },
+          select: { id: true },
+        });
+        const propertyIds = ownedProperties.map((item) => item.id);
+        const ownedUnits = await prisma.unit.findMany({
+          where: { propertyId: { in: propertyIds } },
+          select: { id: true },
+        });
+        const unitIds = ownedUnits.map((item) => item.id);
+        const ownedTenants = await prisma.tenant.findMany({
+          where: { unitId: { in: unitIds } },
+          select: { id: true, status: true },
+        });
+        const tenantIds = ownedTenants.map((item) => item.id);
+        const [openMaintenance, pendingPayments] = await Promise.all([
+          prisma.maintenanceRequest.count({ where: { propertyId: { in: propertyIds }, status: { not: 'closed' } } }),
+          prisma.payment.count({ where: { tenantId: { in: tenantIds }, status: 'pending' } }),
+        ]);
+
+        return res.json({
+          success: true,
+          data: {
+            propertyCount: ownedProperties.length,
+            unitCount: ownedUnits.length,
+            tenantCount: ownedTenants.filter((item) => item.status === 'Active').length,
+            openMaintenance,
+            pendingPayments,
+          },
+        });
+      }
+
+      const tenant = await prisma.tenant.findFirst({
+        where: { userId: user.sub },
+        select: { id: true, unitId: true },
+      });
+      const [openMaintenance, pendingPayments] = tenant
+        ? await Promise.all([
+          prisma.maintenanceRequest.count({ where: { tenantId: tenant.id, status: { not: 'closed' } } }),
+          prisma.payment.count({ where: { tenantId: tenant.id, status: 'pending' } }),
+        ])
+        : [0, 0];
+
+      return res.json({
+        success: true,
+        data: {
+          propertyCount: tenant?.unitId ? 1 : 0,
+          unitCount: tenant?.unitId ? 1 : 0,
+          tenantCount: tenant ? 1 : 0,
+          openMaintenance,
+          pendingPayments,
+        },
+      });
+    } catch (error) {
+      console.error('Unable to load dashboard statistics:', error);
+      return res.status(503).json({ success: false, error: 'Dashboard statistics are temporarily unavailable.' });
+    }
   });
 
   app.get('/api/properties', async (req, res) => {
@@ -1320,11 +1569,31 @@ async function startServer() {
 
     const dbProperties = await readDatabaseOrFallback(undefined, async () => {
       const where = user?.role === 'admin' ? {} : { landlordId: user?.sub ?? '' };
+
+      // Admins see every landlord's portfolio, so the landlord name travels with the row
+      // instead of forcing the client to resolve an opaque landlordId.
+      if (user?.role === 'admin') {
+        const records = await prisma.property.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          include: { landlord: { select: { firstName: true, lastName: true, email: true } } },
+        });
+        return records.map((record) => ({
+          ...mapDbProperty(record),
+          createdAt: record.createdAt.toISOString(),
+          landlordName: `${record.landlord.firstName} ${record.landlord.lastName}`.trim(),
+          landlordEmail: record.landlord.email,
+        }));
+      }
+
       const records = await prisma.property.findMany({
         where,
         orderBy: { createdAt: 'desc' },
       });
-      return records.map(mapDbProperty);
+      return records.map((record) => ({
+        ...mapDbProperty(record),
+        createdAt: record.createdAt.toISOString(),
+      }));
     });
 
     if (dbProperties !== undefined) {
@@ -1407,35 +1676,61 @@ async function startServer() {
     res.status(201).json({ success: true, data: property });
   });
 
-  app.put('/api/properties/:id', (req, res) => {
-    const property = properties.find((item) => item.id === req.params.id);
-    if (!property || !canAccessProperty((req as AuthRequest).user, property)) {
-      return res.status(404).json({ success: false, error: 'Property not found.' });
+  app.put('/api/properties/:id', requireRole('landlord', 'admin'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const { name, address, city, state, units: unitCount, manager } = req.body;
+
+    try {
+      const existing = await prisma.property.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, landlordId: true },
+      });
+      if (!existing || (user.role !== 'admin' && existing.landlordId !== user.sub)) {
+        return res.status(404).json({ success: false, error: 'Property not found.' });
+      }
+
+      const updated = await prisma.property.update({
+        where: { id: existing.id },
+        data: {
+          ...(sanitizeString(name) ? { name: sanitizeString(name) } : {}),
+          ...(sanitizeString(address) ? { address: sanitizeString(address) } : {}),
+          ...(sanitizeString(city) ? { city: sanitizeString(city) } : {}),
+          ...(sanitizeString(state) ? { state: sanitizeString(state) } : {}),
+          ...(unitCount === undefined ? {} : { units: Math.max(0, Math.trunc(Number(unitCount)) || 0) }),
+          ...(sanitizeString(manager) ? { manager: sanitizeString(manager) } : {}),
+        },
+      });
+
+      return res.json({ success: true, data: mapDbProperty(updated) });
+    } catch (error) {
+      console.error('Unable to update property:', error);
+      return res.status(503).json({ success: false, error: 'Unable to update this property right now.' });
     }
-    const { name, address, city, state, units: unitCount, occupancy, status, manager } = req.body;
-    Object.assign(property, {
-      name: name ?? property.name,
-      address: address ?? property.address,
-      city: city ?? property.city,
-      state: state ?? property.state,
-      units: unitCount ?? property.units,
-      occupancy: occupancy ?? property.occupancy,
-      status: status ?? property.status,
-      manager: manager ?? property.manager,
-    });
-    res.json({ success: true, data: property });
   });
 
-  app.delete('/api/properties/:id', (req, res) => {
-    const index = properties.findIndex((item) => item.id === req.params.id);
-    if (index === -1 || !canAccessProperty((req as AuthRequest).user, properties[index])) {
-      return res.status(404).json({ success: false, error: 'Property not found.' });
+  app.delete('/api/properties/:id', requireRole('landlord', 'admin'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+
+    try {
+      const existing = await prisma.property.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, landlordId: true },
+      });
+      if (!existing || (user.role !== 'admin' && existing.landlordId !== user.sub)) {
+        return res.status(404).json({ success: false, error: 'Property not found.' });
+      }
+
+      const unitCount = await prisma.unit.count({ where: { propertyId: existing.id } });
+      if (unitCount > 0) {
+        return res.status(409).json({ success: false, error: 'Remove this property’s units before deleting the property.' });
+      }
+
+      await prisma.property.delete({ where: { id: existing.id } });
+      return res.json({ success: true, message: 'Property deleted.' });
+    } catch (error) {
+      console.error('Unable to delete property:', error);
+      return res.status(503).json({ success: false, error: 'Unable to delete this property right now.' });
     }
-    if (units.some((unit) => unit.propertyId === req.params.id)) {
-      return res.status(409).json({ success: false, error: 'Remove this property’s units before deleting the property.' });
-    }
-    properties.splice(index, 1);
-    res.json({ success: true, message: 'Property deleted.' });
   });
 
   app.get('/api/listings', async (_req, res) => {
@@ -1693,38 +1988,104 @@ async function startServer() {
     }
   });
 
-  app.put('/api/units/:id', (req, res) => {
-    const unit = units.find((item) => item.id === req.params.id);
-    const currentProperty = properties.find((property) => property.id === unit?.propertyId);
-    if (!unit || !currentProperty || !canAccessProperty((req as AuthRequest).user, currentProperty)) {
-      return res.status(404).json({ success: false, error: 'Unit not found.' });
+  app.put('/api/units/:id', requireRole('landlord', 'admin'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const { propertyId, number, floor, bedrooms, bathrooms, rent, status, listingDescription } = req.body;
+    const nextStatus = status === undefined ? undefined : String(status);
+    if (nextStatus !== undefined && !['vacant', 'occupied', 'maintenance'].includes(nextStatus)) {
+      return res.status(400).json({ success: false, error: 'Choose a valid unit status.' });
     }
-    const { propertyId, number, floor, bedrooms, bathrooms, rent, status, tenantId } = req.body;
-    const nextProperty = properties.find((property) => property.id === (propertyId ?? unit.propertyId));
-    if (!nextProperty || !canAccessProperty((req as AuthRequest).user, nextProperty)) {
-      return res.status(404).json({ success: false, error: 'Property not found.' });
+
+    try {
+      const existing = await prisma.unit.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, propertyId: true, status: true, tenantId: true },
+      });
+      if (!existing) {
+        return res.status(404).json({ success: false, error: 'Unit not found.' });
+      }
+
+      const currentProperty = await prisma.property.findUnique({
+        where: { id: existing.propertyId },
+        select: { landlordId: true },
+      });
+      if (!currentProperty || (user.role !== 'admin' && currentProperty.landlordId !== user.sub)) {
+        return res.status(404).json({ success: false, error: 'Unit not found.' });
+      }
+
+      let nextPropertyId = existing.propertyId;
+      if (propertyId && propertyId !== existing.propertyId) {
+        const nextProperty = await prisma.property.findUnique({
+          where: { id: String(propertyId) },
+          select: { id: true, landlordId: true },
+        });
+        if (!nextProperty || (user.role !== 'admin' && nextProperty.landlordId !== user.sub)) {
+          return res.status(404).json({ success: false, error: 'Property not found.' });
+        }
+        nextPropertyId = nextProperty.id;
+      }
+
+      if (nextStatus === 'occupied' && !existing.tenantId) {
+        return res.status(409).json({ success: false, error: 'Assign a tenant to this unit instead of marking it occupied.' });
+      }
+
+      const updated = await prisma.unit.update({
+        where: { id: existing.id },
+        data: {
+          propertyId: nextPropertyId,
+          ...(sanitizeString(number) ? { number: sanitizeString(number) } : {}),
+          ...(floor === undefined ? {} : { floor: Math.trunc(Number(floor)) || 1 }),
+          ...(bedrooms === undefined ? {} : { bedrooms: Math.trunc(Number(bedrooms)) || 0 }),
+          ...(bathrooms === undefined ? {} : { bathrooms: Math.trunc(Number(bathrooms)) || 0 }),
+          ...(rent === undefined ? {} : { rent: Math.max(0, Math.trunc(Number(rent)) || 0) }),
+          ...(nextStatus === undefined ? {} : { status: nextStatus as 'vacant' | 'occupied' | 'maintenance' }),
+          ...(listingDescription === undefined ? {} : { listingDescription: sanitizeString(listingDescription) || null }),
+        },
+      });
+
+      await syncPropertyOccupancy(existing.propertyId);
+      if (nextPropertyId !== existing.propertyId) {
+        await syncPropertyOccupancy(nextPropertyId);
+      }
+
+      return res.json({ success: true, data: mapDbUnit(updated) });
+    } catch (error) {
+      console.error('Unable to update unit:', error);
+      return res.status(503).json({ success: false, error: 'Unable to update this unit right now.' });
     }
-    Object.assign(unit, {
-      propertyId: propertyId ?? unit.propertyId,
-      number: number ?? unit.number,
-      floor: floor !== undefined ? Number(floor) : unit.floor,
-      bedrooms: bedrooms !== undefined ? Number(bedrooms) : unit.bedrooms,
-      bathrooms: bathrooms !== undefined ? Number(bathrooms) : unit.bathrooms,
-      rent: rent !== undefined ? Number(rent) : unit.rent,
-      status: status ?? unit.status,
-      tenantId: tenantId ?? unit.tenantId,
-    });
-    res.json({ success: true, data: unit });
   });
 
-  app.delete('/api/units/:id', (req, res) => {
-    const index = units.findIndex((item) => item.id === req.params.id);
-    const property = index === -1 ? undefined : properties.find((item) => item.id === units[index].propertyId);
-    if (index === -1 || !property || !canAccessProperty((req as AuthRequest).user, property)) {
-      return res.status(404).json({ success: false, error: 'Unit not found.' });
+  app.delete('/api/units/:id', requireRole('landlord', 'admin'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+
+    try {
+      const existing = await prisma.unit.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, propertyId: true, tenantId: true },
+      });
+      if (!existing) {
+        return res.status(404).json({ success: false, error: 'Unit not found.' });
+      }
+
+      const property = await prisma.property.findUnique({
+        where: { id: existing.propertyId },
+        select: { landlordId: true },
+      });
+      if (!property || (user.role !== 'admin' && property.landlordId !== user.sub)) {
+        return res.status(404).json({ success: false, error: 'Unit not found.' });
+      }
+
+      if (existing.tenantId) {
+        return res.status(409).json({ success: false, error: 'Remove the tenant from this unit before deleting it.' });
+      }
+
+      await prisma.unit.delete({ where: { id: existing.id } });
+      await syncPropertyOccupancy(existing.propertyId);
+      return res.json({ success: true, message: 'Unit deleted.' });
+    } catch (error) {
+      console.error('Unable to delete unit:', error);
+      return res.status(503).json({ success: false, error: 'Unable to delete this unit right now.' });
     }
-    units.splice(index, 1);
-    res.json({ success: true, message: 'Unit deleted.' });
   });
 
   app.get('/api/tenants', async (req, res) => {
@@ -1770,97 +2131,204 @@ async function startServer() {
     res.json({ success: true, data: results });
   });
 
-  app.post('/api/tenants', requireRole('landlord', 'admin'), (req, res) => {
-    const { firstName, lastName, email, phone, unitId, status, leaseStart, leaseEnd, rent } = req.body;
+  app.post('/api/tenants', requireRole('landlord', 'admin'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const firstName = sanitizeString(req.body?.firstName);
+    const lastName = sanitizeString(req.body?.lastName);
+    const email = sanitizeString(req.body?.email).toLowerCase();
+    const phone = sanitizeString(req.body?.phone) || null;
+    const unitId = sanitizeString(req.body?.unitId);
+    const status = sanitizeString(req.body?.status) || 'Applicant';
+    const leaseStart = sanitizeString(req.body?.leaseStart);
+    const leaseEnd = sanitizeString(req.body?.leaseEnd);
+    const rent = Math.max(0, Math.trunc(Number(req.body?.rent)) || 0);
+
     if (!firstName || !lastName || !email) {
       return res.status(400).json({ success: false, error: 'First name, last name, and email are required.' });
     }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: 'Please provide a valid email address.' });
+    }
+
+    try {
+      let unit: { id: string; propertyId: string; tenantId: string | null; status: string } | null = null;
+      if (unitId) {
+        const record = await prisma.unit.findUnique({
+          where: { id: unitId },
+          include: { property: { select: { landlordId: true } } },
+        });
+        if (!record || (user.role !== 'admin' && record.property.landlordId !== user.sub)) {
+          return res.status(404).json({ success: false, error: 'Unit not found in your properties.' });
+        }
+        if (record.tenantId || record.status !== 'vacant') {
+          return res.status(409).json({ success: false, error: 'Choose a vacant unit with no tenant assigned.' });
+        }
+        unit = { id: record.id, propertyId: record.propertyId, tenantId: record.tenantId, status: record.status };
+      }
+
+      const created = await prisma.tenant.create({
+        data: {
+          landlordId: user.role === 'admin' ? null : user.sub,
+          firstName,
+          lastName,
+          email,
+          phone,
+          unitId: unit?.id ?? null,
+          status,
+          leaseStart: leaseStart ? new Date(leaseStart) : null,
+          leaseEnd: leaseEnd ? new Date(leaseEnd) : null,
+          rent,
+        },
+      });
+
+      if (unit) {
+        await prisma.unit.update({ where: { id: unit.id }, data: { tenantId: created.id, status: 'occupied' } });
+        await syncPropertyOccupancy(unit.propertyId);
+      }
+
+      return res.status(201).json({ success: true, data: mapDbTenant(created) });
+    } catch (error) {
+      if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') {
+        return res.status(409).json({ success: false, error: 'A tenant record already uses that email address.' });
+      }
+      console.error('Unable to create tenant:', error);
+      return res.status(503).json({ success: false, error: 'Unable to add this tenant right now.' });
+    }
+  });
+
+  app.put('/api/tenants/:id', requireRole('landlord', 'admin'), async (req, res) => {
     const user = (req as AuthRequest).user!;
-    const unit = unitId ? units.find((item) => item.id === unitId) : undefined;
-    const property = unit && properties.find((item) => item.id === unit.propertyId);
-    if (unitId && (!unit || !property || !canAccessProperty(user, property))) {
-      return res.status(404).json({ success: false, error: 'Unit not found in your properties.' });
+    const firstName = sanitizeString(req.body?.firstName);
+    const lastName = sanitizeString(req.body?.lastName);
+    const email = sanitizeString(req.body?.email).toLowerCase();
+    const phone = sanitizeString(req.body?.phone);
+    const nextUnitId = sanitizeString(req.body?.unitId);
+    const status = sanitizeString(req.body?.status);
+    const leaseStart = sanitizeString(req.body?.leaseStart);
+    const leaseEnd = sanitizeString(req.body?.leaseEnd);
+    const rent = req.body?.rent;
+
+    try {
+      const existing = await prisma.tenant.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, landlordId: true, unitId: true },
+      });
+      if (!existing) {
+        return res.status(404).json({ success: false, error: 'Tenant not found.' });
+      }
+
+      let accessGranted = user.role === 'admin' || existing.landlordId === user.sub;
+      if (!accessGranted && existing.unitId) {
+        const currentUnit = await prisma.unit.findUnique({
+          where: { id: existing.unitId },
+          include: { property: { select: { landlordId: true } } },
+        });
+        accessGranted = currentUnit?.property.landlordId === user.sub;
+      }
+      if (!accessGranted) {
+        return res.status(404).json({ success: false, error: 'Tenant not found.' });
+      }
+
+      if (email && !isValidEmail(email)) {
+        return res.status(400).json({ success: false, error: 'Please provide a valid email address.' });
+      }
+
+      let nextUnit: { id: string; propertyId: string; tenantId: string | null; status: string } | null = null;
+      if (nextUnitId && nextUnitId !== existing.unitId) {
+        const record = await prisma.unit.findUnique({
+          where: { id: nextUnitId },
+          include: { property: { select: { landlordId: true } } },
+        });
+        if (!record || (user.role !== 'admin' && record.property.landlordId !== user.sub)) {
+          return res.status(404).json({ success: false, error: 'Unit not found in your properties.' });
+        }
+        if (record.tenantId || record.status !== 'vacant') {
+          return res.status(409).json({ success: false, error: 'Choose a vacant unit with no tenant assigned.' });
+        }
+        nextUnit = { id: record.id, propertyId: record.propertyId, tenantId: record.tenantId, status: record.status };
+      }
+
+      const updated = await prisma.tenant.update({
+        where: { id: existing.id },
+        data: {
+          ...(firstName ? { firstName } : {}),
+          ...(lastName ? { lastName } : {}),
+          ...(email ? { email } : {}),
+          ...(req.body?.phone === undefined ? {} : { phone: phone || null }),
+          ...(status ? { status } : {}),
+          ...(leaseStart ? { leaseStart: new Date(leaseStart) } : {}),
+          ...(leaseEnd ? { leaseEnd: new Date(leaseEnd) } : {}),
+          ...(rent === undefined ? {} : { rent: Math.max(0, Math.trunc(Number(rent)) || 0) }),
+          ...(nextUnit ? { unitId: nextUnit.id } : {}),
+        },
+      });
+
+      if (nextUnit && existing.unitId) {
+        const previousUnit = await prisma.unit.findUnique({
+          where: { id: existing.unitId },
+          select: { id: true, propertyId: true, tenantId: true },
+        });
+        if (previousUnit && previousUnit.tenantId === existing.id) {
+          await prisma.unit.update({ where: { id: previousUnit.id }, data: { tenantId: null, status: 'vacant' } });
+          await syncPropertyOccupancy(previousUnit.propertyId);
+        }
+      }
+      if (nextUnit) {
+        await prisma.unit.update({ where: { id: nextUnit.id }, data: { tenantId: existing.id, status: 'occupied' } });
+        await syncPropertyOccupancy(nextUnit.propertyId);
+      }
+
+      return res.json({ success: true, data: mapDbTenant(updated) });
+    } catch (error) {
+      if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') {
+        return res.status(409).json({ success: false, error: 'A tenant record already uses that email address.' });
+      }
+      console.error('Unable to update tenant:', error);
+      return res.status(503).json({ success: false, error: 'Unable to update this tenant right now.' });
     }
-    if (unit && (unit.tenantId || unit.status.toLowerCase() !== 'vacant')) {
-      return res.status(409).json({ success: false, error: 'Choose a vacant unit with no tenant assigned.' });
-    }
-    const tenant: Tenant = {
-      id: createId('tenant'),
-      landlordId: user.sub,
-      firstName,
-      lastName,
-      email,
-      phone,
-      unitId,
-      status: status || 'Applicant',
-      leaseStart,
-      leaseEnd,
-      rent: Number(rent || 0),
-    };
-    tenants.push(tenant);
-    if (unit && property) {
-      unit.tenantId = tenant.id;
-      unit.status = 'occupied';
-      property.occupancy = Math.min(property.occupancy + 1, property.units);
-    }
-    res.status(201).json({ success: true, data: tenant });
   });
 
-  app.put('/api/tenants/:id', requireRole('landlord', 'admin'), (req, res) => {
-    const tenant = tenants.find((item) => item.id === req.params.id);
-    if (!tenant || !canAccessTenant((req as AuthRequest).user, tenant)) {
-      return res.status(404).json({ success: false, error: 'Tenant not found.' });
-    }
-    const { firstName, lastName, email, phone, unitId, status, leaseStart, leaseEnd, rent } = req.body;
-    if (unitId && unitId !== tenant.unitId) {
-      const newUnit = units.find((item) => item.id === unitId);
-      const newProperty = newUnit && properties.find((item) => item.id === newUnit.propertyId);
-      if (!newUnit || !newProperty || !canAccessProperty((req as AuthRequest).user, newProperty)) {
-        return res.status(404).json({ success: false, error: 'Unit not found in your properties.' });
-      }
-      if (newUnit.tenantId || newUnit.status.toLowerCase() !== 'vacant') {
-        return res.status(409).json({ success: false, error: 'Choose a vacant unit with no tenant assigned.' });
-      }
-      const oldUnit = units.find((item) => item.id === tenant.unitId);
-      const oldProperty = oldUnit && properties.find((item) => item.id === oldUnit.propertyId);
-      if (oldUnit) {
-        oldUnit.tenantId = undefined;
-        oldUnit.status = 'vacant';
-        if (oldProperty) oldProperty.occupancy = Math.max(0, oldProperty.occupancy - 1);
-      }
-      newUnit.tenantId = tenant.id;
-      newUnit.status = 'occupied';
-      newProperty.occupancy = Math.min(newProperty.occupancy + 1, newProperty.units);
-    }
-    Object.assign(tenant, {
-      firstName: firstName ?? tenant.firstName,
-      lastName: lastName ?? tenant.lastName,
-      email: email ?? tenant.email,
-      phone: phone ?? tenant.phone,
-      unitId: unitId ?? tenant.unitId,
-      status: status ?? tenant.status,
-      leaseStart: leaseStart ?? tenant.leaseStart,
-      leaseEnd: leaseEnd ?? tenant.leaseEnd,
-      rent: rent !== undefined ? Number(rent) : tenant.rent,
-    });
-    res.json({ success: true, data: tenant });
-  });
+  app.delete('/api/tenants/:id', requireRole('landlord', 'admin'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
 
-  app.delete('/api/tenants/:id', requireRole('landlord', 'admin'), (req, res) => {
-    const index = tenants.findIndex((item) => item.id === req.params.id);
-    const tenant = index === -1 ? undefined : tenants[index];
-    if (!tenant || !canAccessTenant((req as AuthRequest).user, tenant)) {
-      return res.status(404).json({ success: false, error: 'Tenant not found.' });
+    try {
+      const existing = await prisma.tenant.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, landlordId: true, unitId: true },
+      });
+      if (!existing) {
+        return res.status(404).json({ success: false, error: 'Tenant not found.' });
+      }
+
+      let accessGranted = user.role === 'admin' || existing.landlordId === user.sub;
+      if (!accessGranted && existing.unitId) {
+        const unit = await prisma.unit.findUnique({
+          where: { id: existing.unitId },
+          include: { property: { select: { landlordId: true } } },
+        });
+        accessGranted = unit?.property.landlordId === user.sub;
+      }
+      if (!accessGranted) {
+        return res.status(404).json({ success: false, error: 'Tenant not found.' });
+      }
+
+      if (existing.unitId) {
+        const unit = await prisma.unit.findUnique({
+          where: { id: existing.unitId },
+          select: { id: true, propertyId: true, tenantId: true },
+        });
+        if (unit && unit.tenantId === existing.id) {
+          await prisma.unit.update({ where: { id: unit.id }, data: { tenantId: null, status: 'vacant' } });
+          await syncPropertyOccupancy(unit.propertyId);
+        }
+      }
+
+      await prisma.tenant.delete({ where: { id: existing.id } });
+      return res.json({ success: true, message: 'Tenant deleted.' });
+    } catch (error) {
+      console.error('Unable to delete tenant:', error);
+      return res.status(503).json({ success: false, error: 'Unable to delete this tenant right now.' });
     }
-    const unit = units.find((item) => item.id === tenant.unitId);
-    const property = unit && properties.find((item) => item.id === unit.propertyId);
-    if (unit) {
-      unit.tenantId = undefined;
-      unit.status = 'vacant';
-      if (property) property.occupancy = Math.max(0, property.occupancy - 1);
-    }
-    tenants.splice(index, 1);
-    res.json({ success: true, message: 'Tenant deleted.' });
   });
 
   app.get('/api/payments', async (req, res) => {
@@ -1918,7 +2386,17 @@ async function startServer() {
       return res.json({ success: true, data: dbPayments });
     }
 
-    let results = [...payments];
+    // Degraded development fallback only. It stays scoped to the caller so a failed
+    // database read never turns into a cross-account data leak.
+    let results = user?.role === 'admin'
+      ? [...payments]
+      : user?.role === 'tenant'
+        ? payments.filter((payment) => tenants.some((tenant) => tenant.userId === user.sub && tenant.id === payment.tenantId))
+        : payments.filter((payment) => {
+          const tenant = tenants.find((item) => item.id === payment.tenantId);
+          const unit = tenant?.unitId ? units.find((item) => item.id === tenant.unitId) : undefined;
+          return Boolean(unit && properties.some((property) => property.id === unit.propertyId && property.landlordId === user?.sub));
+        });
     if (tenantId) {
       results = results.filter((payment) => payment.tenantId === tenantId);
     }
@@ -1928,44 +2406,65 @@ async function startServer() {
     res.json({ success: true, data: results });
   });
 
-  app.post('/api/payments', async (req, res) => {
-    const { tenantId, unitId, amount, dueDate, paidDate, status, method } = req.body;
-    if (!tenantId || !unitId || !amount || !dueDate) {
+  app.post('/api/payments', requireRole('landlord', 'admin'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const { tenantId, unitId, dueDate, paidDate, status, method } = req.body;
+    const amount = Number(req.body?.amount);
+
+    if (!tenantId || !unitId || !dueDate) {
       return res.status(400).json({ success: false, error: 'Tenant ID, unit ID, amount, and due date are required.' });
     }
+    if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount <= 0 || amount > 100_000_000) {
+      return res.status(400).json({ success: false, error: 'Enter a payment amount as a whole number greater than zero.' });
+    }
+    if (Number.isNaN(Date.parse(String(dueDate)))) {
+      return res.status(400).json({ success: false, error: 'Enter a valid due date.' });
+    }
+    if (paidDate && Number.isNaN(Date.parse(String(paidDate)))) {
+      return res.status(400).json({ success: false, error: 'Enter a valid paid date.' });
+    }
+    if (status !== undefined && !['paid', 'pending', 'overdue'].includes(String(status))) {
+      return res.status(400).json({ success: false, error: 'Choose a valid payment status.' });
+    }
 
-    const dbPayment = await readDatabaseOrFallback(undefined, async () => {
+    try {
       const tenant = await prisma.tenant.findUnique({
-        where: { id: tenantId },
-        include: { landlord: true },
+        where: { id: String(tenantId) },
+        select: { id: true, landlordId: true },
       });
       if (!tenant) {
-        return { type: 'error', status: 404, message: 'Tenant not found.' };
-      }
-      const unit = await prisma.unit.findUnique({ where: { id: unitId } });
-      if (!unit) {
-        return { type: 'error', status: 404, message: 'Unit not found.' };
+        return res.status(404).json({ success: false, error: 'Tenant not found.' });
       }
 
-      if ((req as AuthRequest).user?.role === 'landlord' && tenant.landlordId !== (req as AuthRequest).user?.sub) {
-        return { type: 'error', status: 403, message: 'You do not have access to this tenant.' };
+      // The unit is only accepted if it belongs to the same landlord as the tenant record,
+      // so a payment can never be attached to someone else's property.
+      const unit = await prisma.unit.findUnique({
+        where: { id: String(unitId) },
+        select: { id: true, property: { select: { landlordId: true } } },
+      });
+      if (!unit) {
+        return res.status(404).json({ success: false, error: 'Unit not found.' });
+      }
+      if (user.role !== 'admin') {
+        if (tenant.landlordId !== user.sub || unit.property.landlordId !== user.sub) {
+          return res.status(404).json({ success: false, error: 'Tenant not found.' });
+        }
       }
 
       const record = await prisma.payment.create({
         data: {
-          tenantId,
-          unitId,
-          amount: Number(amount),
-          dueDate: new Date(dueDate),
-          paidDate: paidDate ? new Date(paidDate) : null,
+          tenantId: tenant.id,
+          unitId: unit.id,
+          amount,
+          dueDate: new Date(String(dueDate)),
+          paidDate: paidDate ? new Date(String(paidDate)) : null,
           status: (status || (paidDate ? 'paid' : 'pending')) as 'paid' | 'pending' | 'overdue',
-          method: method || 'Manual',
+          method: sanitizeString(method) || 'Manual',
         },
       });
 
-      return {
-        type: 'success',
-        status: 201,
+      return res.status(201).json({
+        success: true,
         data: {
           id: record.id,
           tenantId: record.tenantId,
@@ -1976,28 +2475,11 @@ async function startServer() {
           status: record.status,
           method: record.method,
         },
-      };
-    });
-
-    if (dbPayment && dbPayment.type === 'error') {
-      return res.status(dbPayment.status).json({ success: false, error: dbPayment.message });
+      });
+    } catch (error) {
+      console.error('Unable to record payment:', error);
+      return res.status(503).json({ success: false, error: 'Payments are temporarily unavailable. Please try again shortly.' });
     }
-    if (dbPayment && dbPayment.type === 'success') {
-      return res.status(dbPayment.status).json({ success: true, data: dbPayment.data });
-    }
-
-    const payment: Payment = {
-      id: createId('payment'),
-      tenantId,
-      unitId,
-      amount: Number(amount),
-      dueDate,
-      paidDate,
-      status: (status || (paidDate ? 'paid' : 'pending')) as Payment['status'],
-      method: method || 'Manual',
-    };
-    payments.push(payment);
-    res.status(201).json({ success: true, data: payment });
   });
 
   app.get('/api/maintenance', async (req, res) => {
@@ -2231,159 +2713,118 @@ async function startServer() {
     return res.json({ success: true, data: request });
   });
 
-  app.get('/api/messages', (req, res) => {
-    const { recipient, sender } = req.query;
-    let results = [...messages];
-    if (recipient) {
-      results = results.filter((message) => message.recipient === recipient);
-    }
-    if (sender) {
-      results = results.filter((message) => message.sender === sender);
-    }
-    res.json({ success: true, data: results });
-  });
+  app.get('/api/messages', async (req, res) => {
+    const user = (req as AuthRequest).user!;
 
-  app.post('/api/messages', (req, res) => {
-    const { sender, recipient, subject, body } = req.body;
-    if (!sender || !recipient || !subject || !body) {
-      return res.status(400).json({ success: false, error: 'Sender, recipient, subject, and body are required.' });
-    }
-    const message: Message = {
-      id: createId('msg'),
-      sender,
-      recipient,
-      subject,
-      body,
-      createdAt: new Date().toISOString(),
-      read: false,
-    };
-    messages.unshift(message);
-    res.status(201).json({ success: true, data: message });
-  });
-
-  app.get('/api/documents', (req, res) => {
-    const user = (req as AuthRequest).user;
-    if (!user) {
-      return res.status(401).json({ success: false, error: 'Authentication required.' });
-    }
-
-    let data = [...documents];
-    if (user.role === 'tenant') {
-      data = data.filter((document) => !document.ownerId || document.ownerId === user.sub);
-    }
-
-    return res.json({ success: true, data });
-  });
-
-  app.post('/api/documents', (req, res) => {
-    const user = (req as AuthRequest).user;
-    if (!user) {
-      return res.status(401).json({ success: false, error: 'Authentication required.' });
-    }
-
-    const { name, type, date, size, tags, url } = req.body ?? {};
-    if (!name || !type) {
-      return res.status(400).json({ success: false, error: 'Document name and type are required.' });
-    }
-
-    const document: Document = {
-      id: createId('doc'),
-      name: sanitizeString(name),
-      type: sanitizeString(type),
-      date: sanitizeString(date) || new Date().toISOString().split('T')[0],
-      size: sanitizeString(size) || '0 KB',
-      tags: Array.isArray(tags) ? tags.map((tag: unknown) => sanitizeString(String(tag))).filter(Boolean) : [],
-      ownerId: user.role === 'tenant' ? user.sub : undefined,
-      url: sanitizeString(url),
-    };
-
-    documents.unshift(document);
-    return res.status(201).json({ success: true, data: document });
-  });
-
-  app.post('/api/scan-document', async (req, res) => {
     try {
-      const { fileName, mimeType, base64Data } = req.body;
-      if (!base64Data) {
-        return res.status(400).json({ success: false, error: 'Missing document data' });
+      const records = await prisma.message.findMany({
+        where: { OR: [{ senderId: user.sub }, { recipientId: user.sub }] },
+        orderBy: { createdAt: 'desc' },
+        take: 200,
+      });
+      return res.json({ success: true, data: records });
+    } catch (error) {
+      console.error('Unable to load messages:', error);
+      return res.status(503).json({ success: false, error: 'Messages are temporarily unavailable.' });
+    }
+  });
+
+  // The sender is always the authenticated account, never a value taken from the request.
+  app.post('/api/messages', async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const recipientId = sanitizeString(req.body?.recipientId);
+    const subject = sanitizeString(req.body?.subject);
+    const body = sanitizeString(req.body?.body);
+
+    if (!recipientId || !subject || !body) {
+      return res.status(400).json({ success: false, error: 'Recipient, subject and message body are required.' });
+    }
+    if (subject.length > 160 || body.length > 4000) {
+      return res.status(400).json({ success: false, error: 'Keep the subject under 160 and the message under 4,000 characters.' });
+    }
+
+    try {
+      const recipient = await prisma.user.findUnique({ where: { id: recipientId }, select: { id: true } });
+      if (!recipient) {
+        return res.status(404).json({ success: false, error: 'Recipient not found.' });
       }
 
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) {
-        return res.status(500).json({ success: false, error: 'GEMINI_API_KEY is not configured on the server.' });
-      }
-      
-      const { GoogleGenAI, Type } = await import('@google/genai');
-      const ai = new GoogleGenAI({ apiKey });
+      const record = await prisma.message.create({
+        data: { senderId: user.sub, recipientId: recipient.id, subject, body },
+      });
+      return res.status(201).json({ success: true, data: record });
+    } catch (error) {
+      console.error('Unable to send message:', error);
+      return res.status(503).json({ success: false, error: 'Unable to send this message right now.' });
+    }
+  });
 
-      const inlineDataContent = {
-        inlineData: {
-          data: base64Data.split(',')[1] || base64Data,
-          mimeType: mimeType || 'application/pdf',
-        },
-      };
+  app.get('/api/documents', async (req, res) => {
+    const user = (req as AuthRequest).user!;
 
-      const prompt = `You are an AI document analysis system for a property management platform.\nExamine the attached document.\nIdentify the document type (strictly one of: 'Lease', 'Receipt', 'Notice', or 'Other').\nExtract the most significant primary date associated with this document (in YYYY-MM-DD format).\nAdditionally, extract any other relevant dates to help with metadata tagging.`;
+    try {
+      const records = await prisma.document.findMany({
+        where: { ownerId: user.sub },
+        orderBy: { date: 'desc' },
+      });
+      return res.json({
+        success: true,
+        data: records.map((record) => ({
+          id: record.id,
+          name: record.name,
+          type: record.type,
+          date: record.date.toISOString().split('T')[0],
+          size: record.size,
+          tags: record.tags,
+        })),
+      });
+    } catch (error) {
+      console.error('Unable to load documents:', error);
+      return res.status(503).json({ success: false, error: 'Documents are temporarily unavailable.' });
+    }
+  });
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [inlineDataContent, { text: prompt }],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              type: { type: Type.STRING, enum: ['Lease', 'Receipt', 'Notice', 'Other'] },
-              primaryDate: { type: Type.STRING },
-              extractedDates: { type: Type.ARRAY, items: { type: Type.STRING } },
-              summary: { type: Type.STRING },
-            },
-            required: ['type', 'primaryDate', 'extractedDates', 'summary'],
-          },
+  // Only document metadata is stored. No file bytes and no external URL are accepted,
+  // so this endpoint can never become a back door for identity or financial files.
+  app.post('/api/documents', async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    const name = sanitizeString(req.body?.name);
+    const requestedType = sanitizeString(req.body?.type);
+    const dateInput = sanitizeString(req.body?.date);
+    const size = sanitizeString(req.body?.size) || '0 KB';
+    const tags = Array.isArray(req.body?.tags)
+      ? req.body.tags.slice(0, 10).map((tag: unknown) => sanitizeString(String(tag)).slice(0, 40)).filter(Boolean)
+      : [];
+
+    if (!name) {
+      return res.status(400).json({ success: false, error: 'A document name is required.' });
+    }
+
+    const type = ['Lease', 'Receipt', 'Notice', 'Other'].includes(requestedType) ? requestedType : 'Other';
+    const date = dateInput ? new Date(dateInput) : new Date();
+    if (Number.isNaN(date.getTime())) {
+      return res.status(400).json({ success: false, error: 'Provide a valid document date.' });
+    }
+
+    try {
+      const record = await prisma.document.create({
+        data: { ownerId: user.sub, name: name.slice(0, 160), type, date, size, tags },
+      });
+      return res.status(201).json({
+        success: true,
+        data: {
+          id: record.id,
+          name: record.name,
+          type: record.type,
+          date: record.date.toISOString().split('T')[0],
+          size: record.size,
+          tags: record.tags,
         },
       });
-
-      if (!response.text) {
-        throw new Error('No text generated by Gemini.');
-      }
-      const resultObj = JSON.parse(response.text);
-      res.json({ success: true, data: resultObj });
-    } catch (error: any) {
-      console.error('Document scan error:', error);
-      res.status(500).json({ success: false, error: error.message || 'Failed to process document using AI.' });
+    } catch (error) {
+      console.error('Unable to save document record:', error);
+      return res.status(503).json({ success: false, error: 'Unable to save this document record right now.' });
     }
-  });
-
-  app.post('/api/screen-tenant', async (req, res) => {
-    const { tenantId, firstName, lastName, email } = req.body;
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    if (!tenantId || !firstName || !lastName) {
-      return res.status(400).json({ success: false, error: 'Missing required tenant information (ID, First Name, or Last Name).' });
-    }
-
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ success: false, error: 'Invalid or missing tenant email address. Email is required for screening.' });
-    }
-
-    if (Math.random() > 0.85) {
-      return res.status(503).json({ success: false, error: 'The screening service provider (TransUnion) is currently unavailable. Please try again later.' });
-    }
-
-    const score = 500 + Math.floor(Math.random() * 300);
-    const mockReport = {
-      id: `scr_${Date.now()}`,
-      tenantId,
-      status: 'completed',
-      creditScore: score,
-      recommendation: score > 680 ? 'Approve' : score > 620 ? 'Review' : 'Decline',
-      criminalRecords: Math.random() > 0.9 ? 1 : 0,
-      evictionHistory: Math.random() > 0.85 ? 1 : 0,
-      dateCompleted: new Date().toISOString(),
-      provider: 'TransUnionMock',
-    };
-
-    res.json({ success: true, report: mockReport });
   });
 
   if (process.env.NODE_ENV !== 'production') {
