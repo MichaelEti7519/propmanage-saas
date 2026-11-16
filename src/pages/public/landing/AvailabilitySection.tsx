@@ -12,9 +12,9 @@ const availableNow = [
 ];
 
 const comingNext = [
-  'Online rent payments',
-  'Identity and property verification',
-  'Phone number verification by OTP',
+  { item: 'Online rent payments', note: 'Run through a licensed payment provider, not collected on this site.' },
+  { item: 'Identity and property verification', note: 'Checked by a hosted provider; documents never sit in this app.' },
+  { item: 'Phone number verification by OTP', note: 'A one-time code sent to the number on the account.' },
 ];
 
 export function AvailabilitySection() {
@@ -55,17 +55,23 @@ export function AvailabilitySection() {
                 Coming next
               </p>
 
-              <ul className="mt-6 space-y-3.5">
-                {comingNext.map((item) => (
-                  <li key={item} className="flex items-start gap-3 text-[13.5px] leading-6 text-[#5E554D]">
+              <ul className="mt-6 space-y-4">
+                {comingNext.map((entry) => (
+                  <li key={entry.item} className="flex items-start gap-3">
                     <Clock3 className="mt-1 h-4 w-4 shrink-0 text-[#95651D]" />
-                    {item}
+                    <div>
+                      <p className="text-[13.5px] font-medium leading-6 text-[#332D29]">{entry.item}</p>
+                      <p className="mt-0.5 text-[11.5px] leading-5 text-[#756B61]">{entry.note}</p>
+                    </div>
                   </li>
                 ))}
               </ul>
 
               <p className="mt-6 border-t border-[#B9A58B]/40 pt-4 text-[11.5px] leading-5 text-[#756B61]">
-                Until a check is completed, the status stays pending. No badges are shown early.
+                Until a check is completed, the status stays pending. No badges are shown.
+              </p>
+              <p className="mt-2 text-[11.5px] leading-5 text-[#756B61]">
+                These are planned, not live. They ship when they are safe to ship.
               </p>
             </div>
           </AnimatedContent>

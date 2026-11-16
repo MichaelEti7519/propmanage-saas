@@ -55,15 +55,9 @@ export function StorySection() {
               fixing, and what was said about it. Nothing has to be reconstructed from memory.
             </p>
 
-            <div className="mt-8 flex flex-wrap gap-x-6 gap-y-2 text-[11.5px] font-medium text-[#8A7E72]">
-              <span className="flex items-center gap-2">
-                <span aria-hidden="true" className="h-1 w-1 rounded-full bg-[#B9A58B]" />
-                One record per unit
-              </span>
-              <span className="flex items-center gap-2">
-                <span aria-hidden="true" className="h-1 w-1 rounded-full bg-[#B9A58B]" />
-                Shared between both sides
-              </span>
+            <div className="mt-8 flex flex-wrap gap-x-7 gap-y-2 text-[11.5px] font-medium text-[#8A7E72]">
+              <span>One record per unit</span>
+              <span>Shared between both sides</span>
             </div>
           </div>
         </div>

@@ -81,7 +81,7 @@ function RentCycleCard() {
   );
 }
 
-function PhotoStrip() {
+export function PhotoBand() {
   const shots = [
     { photo: propertyPhotos[0], caption: 'The building' },
     { photo: propertyPhotos[1], caption: 'The interior' },
@@ -89,8 +89,13 @@ function PhotoStrip() {
   ];
 
   return (
-    <div className="relative z-20 -mt-12 px-3 sm:-mt-16 sm:px-6">
+    <section aria-label="Illustrative property imagery" className="bg-white pb-6 sm:pb-10">
       <div className={pageShell}>
+        <div className="mb-5 flex flex-wrap items-baseline justify-between gap-2 border-t border-[#E8DDCC]/80 pt-10 sm:pt-12">
+          <p className={mutedLabel}>Homes on the record</p>
+          <p className="text-[10px] uppercase tracking-[0.14em] text-[#B9A58B]">Illustrative imagery</p>
+        </div>
+
         <div className="hide-scrollbar -mx-5 flex gap-3 overflow-x-auto px-5 sm:mx-0 sm:grid sm:grid-cols-3 sm:gap-4 sm:overflow-visible sm:px-0">
           {shots.map((shot, index) => (
             <motion.figure
@@ -115,13 +120,13 @@ function PhotoStrip() {
           ))}
         </div>
       </div>
-    </div>
+    </section>
   );
 }
 
 function CapabilityStrip() {
   return (
-    <div className="marquee relative mt-10 overflow-hidden border-y border-[#E8DDCC]/80 bg-white py-4 sm:mt-14">
+    <div className="marquee relative overflow-hidden border-y border-[#E8DDCC]/80 bg-white py-4">
       <div className="[mask-image:linear-gradient(to_right,transparent,black_6%,black_94%,transparent)]">
         <div className="marquee-track flex w-max items-center whitespace-nowrap text-[11px] font-semibold uppercase tracking-[0.18em] text-[#8A7E72]">
           {[...capabilities, ...capabilities].map((item, index) => (
@@ -130,7 +135,7 @@ function CapabilityStrip() {
               aria-hidden={index >= capabilities.length ? true : undefined}
               className="flex items-center gap-3 pr-9"
             >
-              <span aria-hidden="true" className="h-1 w-1 rounded-full bg-[#B9A58B]" />
+              <span aria-hidden="true" className="h-3 w-px bg-[#B9A58B]/60" />
               {item}
             </span>
           ))}
@@ -274,7 +279,6 @@ export function Hero() {
         </div>
       </section>
 
-      <PhotoStrip />
       <CapabilityStrip />
     </>
   );

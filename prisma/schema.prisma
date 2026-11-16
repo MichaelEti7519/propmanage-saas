@@ -92,6 +92,17 @@ model User {
   reportsReviewed Report[]        @relation("ReportReviewer")
   messagesSent  Message[]         @relation("MessageSender")
   messagesReceived Message[]      @relation("MessageRecipient")
+  auditEntries  AuditLog[]        @relation("AuditActor")
+  verificationReviews VerificationReview[] @relation("UserVerificationReviews")
+  verificationDecisions VerificationReview[] @relation("VerificationReviewsGiven")
+  /// Second factor. The secret is only written while setup is in progress; enabling requires a
+  /// valid code, and recovery codes are stored as SHA-256 hashes, never in the clear.
+    totpSecret            String?
+    totpEnabledAt         DateTime?
+    recoveryCodes         String[]                      @default([])
+    refreshTokens         RefreshToken[]                @relation("UserRefreshTokens")
+    passwordResets        PasswordResetToken[]          @relation("UserPasswordResets")
+    emailVerifications    EmailVerificationToken[]      @relation("UserEmailVerifications")
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
 }
@@ -292,4 +303,87 @@ model Document {
   updatedAt DateTime @updatedAt
 
   @@index([ownerId, createdAt])
+}
+
+/// Records who did what to whom inside the admin area. Entries deliberately keep only the
+/// identifiers and the decision, never the report or enquiry text, so the log itself cannot
+/// become a second copy of user-submitted personal data.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  actorEmail String
+  actorRole  UserRole
+  action     String
+  targetType String
+  targetId   String?
+  summary    String
+  detail     Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([action, createdAt])
+}
+
+/// Rotation-based session record. Only the SHA-256 hash of a refresh token is stored, so a database
+/// read cannot mint a session. Reusing a rotated token revokes the whole family for that user.
+model RefreshToken {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation("UserRefreshTokens", fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash     String    @unique
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason String?
+  userAgent     String?
+  createdAt     DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+}
+
+/// Time-boxed, single-use password reset request. The token itself only ever exists in the link.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation("UserPasswordResets", fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+}
+
+/// Single-use email ownership proof. Confirming one writes a VerificationReview row, so the
+/// verified badge still has a named reviewer and a stated basis.
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation("UserEmailVerifications", fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+}
+
+/// One row per recorded verification decision. A "verified" badge is only credible because a row
+/// here names the reviewer and the basis for the decision, so a status cannot be flipped without
+/// an accountable person and a described check.
+model VerificationReview {
+  id         String             @id @default(cuid())
+  userId     String
+  user       User               @relation("UserVerificationReviews", fields: [userId], references: [id], onDelete: Cascade)
+  field      String
+  fromStatus VerificationStatus
+  toStatus   VerificationStatus
+  basis      String
+  reviewerId String
+  reviewer   User               @relation("VerificationReviewsGiven", fields: [reviewerId], references: [id], onDelete: Restrict)
+  createdAt  DateTime           @default(now())
+
+  @@index([userId, createdAt])
+  @@index([reviewerId, createdAt])
 }

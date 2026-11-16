@@ -4,12 +4,13 @@ import cors from 'cors';
 import express from "express";
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
-import { createHash, randomBytes, randomUUID } from 'crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'crypto';
 import { promises as fsp } from 'fs';
 import rateLimit from 'express-rate-limit';
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { fileURLToPath } from 'url';
+import type { Prisma } from '@prisma/client';
 import { prisma } from './src/lib/prisma';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -31,6 +32,10 @@ interface User {
   incomeVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
   payoutVerificationStatus?: 'not_started' | 'pending' | 'verified' | 'rejected' | 'needs_review';
   passwordHash: string;
+  /** Second factor state, carried on the local interface because issueSession() reads it. */
+  totpSecret?: string | null;
+  totpEnabledAt?: Date | null;
+  recoveryCodes?: string[];
 }
 interface Report {
   id: string;
@@ -142,6 +147,39 @@ async function syncPropertyOccupancy(propertyId: string) {
   await prisma.property.update({ where: { id: propertyId }, data: { occupancy: occupied } });
 }
 
+/**
+ * Admin decisions that change another account's standing are recorded so the call can be
+ * reconstructed later. The write is best-effort: the action itself has already committed, so a
+ * failed log line is reported on the server rather than rolling back a completed decision.
+ */
+async function recordAudit(entry: {
+  actorId?: string;
+  actorEmail: string;
+  actorRole: User['role'];
+  action: string;
+  targetType: string;
+  targetId?: string | null;
+  summary: string;
+  detail?: Prisma.InputJsonValue;
+}) {
+  try {
+    await prisma.auditLog.create({
+      data: {
+        actorId: entry.actorId ?? null,
+        actorEmail: entry.actorEmail,
+        actorRole: entry.actorRole,
+        action: entry.action,
+        targetType: entry.targetType,
+        targetId: entry.targetId ?? null,
+        summary: entry.summary,
+        detail: entry.detail,
+      },
+    });
+  } catch (error) {
+    console.error('Unable to write audit entry:', error instanceof Error ? error.message : error);
+  }
+}
+
 function mapDbTenant(tenant: any): Tenant {
   return {
     id: tenant.id,
@@ -201,6 +239,163 @@ function createAuthToken(user: User) {
     JWT_SECRET,
     { expiresIn: JWT_EXPIRY, jwtid: jti }
   );
+}
+
+// ---- Sessions, password reset, and second factor ----------------------------------------------
+
+const REFRESH_TOKEN_TTL_DAYS = 30;
+const PASSWORD_RESET_TTL_MINUTES = 60;
+const EMAIL_VERIFICATION_TTL_HOURS = 24;
+const MFA_TOKEN_TTL = '5m';
+const TOTP_STEP_SECONDS = 30;
+
+function hashToken(token: string) {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function newOpaqueToken(bytes = 32) {
+  return randomBytes(bytes).toString('base64url');
+}
+
+function appBaseUrl() {
+  return (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
+}
+
+async function sendAccountEmail(to: string, subject: string, text: string) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return false;
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: process.env.EMAIL_FROM || 'PropManage <onboarding@resend.dev>',
+        to,
+        subject,
+        text,
+      }),
+    });
+    return response.ok;
+  } catch (error) {
+    console.error('Unable to send account email:', error);
+    return false;
+  }
+}
+
+// The link is only ever logged outside production. In production it must travel by email, otherwise
+// the request endpoint reports success and no link exists — which is honest, not silently broken.
+async function deliverAccountLink(email: string, label: string, link: string, subject: string, text: string) {
+  const sent = await sendAccountEmail(email, subject, text);
+  if (!sent && process.env.NODE_ENV !== 'production') {
+    console.log(`[${label}] ${email} -> ${link}`);
+  }
+  return sent;
+}
+
+async function issueSession(user: User, userAgent?: string | null) {
+  const refreshToken = newOpaqueToken(48);
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+  await prisma.refreshToken.create({
+    data: {
+      userId: user.id,
+      tokenHash: hashToken(refreshToken),
+      expiresAt,
+      userAgent: userAgent ? userAgent.slice(0, 200) : null,
+    },
+  });
+  return {
+    token: createAuthToken(user),
+    refreshToken,
+    refreshTokenExpiresAt: expiresAt.toISOString(),
+  };
+}
+
+async function revokeAllSessions(userId: string, reason: string) {
+  await prisma.refreshToken.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date(), revokedReason: reason },
+  });
+}
+
+// TOTP (RFC 6238) is implemented directly so the second factor adds no dependency and no build step.
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(buffer: Buffer) {
+  let bits = 0;
+  let value = 0;
+  let output = '';
+  for (const byte of buffer) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  return output;
+}
+
+function base32Decode(input: string) {
+  const cleaned = input.toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = 0;
+  let value = 0;
+  const bytes: number[] = [];
+  for (const char of cleaned) {
+    const index = BASE32_ALPHABET.indexOf(char);
+    if (index === -1) continue;
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function totpCode(secret: string, counter: number) {
+  const counterBuffer = Buffer.alloc(8);
+  counterBuffer.writeBigUInt64BE(BigInt(counter));
+  const digest = createHmac('sha1', base32Decode(secret)).update(counterBuffer).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  const binary = ((digest[offset] & 0x7f) << 24)
+    | (digest[offset + 1] << 16)
+    | (digest[offset + 2] << 8)
+    | digest[offset + 3];
+  return String(binary % 1_000_000).padStart(6, '0');
+}
+
+// One step of drift either way: phone clocks are rarely exact to the second.
+function verifyTotp(secret: string, code: string, window = 1) {
+  const normalized = String(code ?? '').replace(/\s+/g, '');
+  if (!/^\d{6}$/.test(normalized)) return false;
+  const counter = Math.floor(Date.now() / (TOTP_STEP_SECONDS * 1000));
+  for (let drift = -window; drift <= window; drift += 1) {
+    if (totpCode(secret, counter + drift) === normalized) return true;
+  }
+  return false;
+}
+
+function generateRecoveryCodes(count = 8) {
+  return Array.from({ length: count }, () => {
+    const raw = randomBytes(5).toString('hex');
+    return `${raw.slice(0, 5)}-${raw.slice(5)}`;
+  });
+}
+
+async function consumeRecoveryCode(userId: string, code: string) {
+  const normalized = String(code ?? '').trim().toLowerCase().replace(/\s+/g, '');
+  if (!normalized) return false;
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { recoveryCodes: true } });
+  if (!user) return false;
+  const match = user.recoveryCodes.find((entry) => entry === hashToken(normalized));
+  if (!match) return false;
+  await prisma.user.update({
+    where: { id: userId },
+    data: { recoveryCodes: user.recoveryCodes.filter((entry) => entry !== match) },
+  });
+  return true;
 }
 
 function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -442,9 +637,12 @@ async function startServer() {
     message: { success: false, error: 'Too many requests, please try again later.' },
   });
 
+  // Failed-authentication budget per 15 minutes. Overridable so a scripted run against a local
+  // instance does not exhaust it, and so the limit can be tuned without a code change.
+  const authLimitMax = Number(process.env.AUTH_RATE_LIMIT_MAX ?? 5);
   const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 5,
+    max: Number.isFinite(authLimitMax) && authLimitMax > 0 ? authLimitMax : 5,
     standardHeaders: true,
     legacyHeaders: false,
     skipSuccessfulRequests: true,
@@ -478,7 +676,7 @@ async function startServer() {
   app.use('/api', apiLimiter);
   app.use('/api/auth', authLimiter);
 
-  const publicApiPaths = ['/api/health', '/api/auth/login', '/api/auth/register', '/api/contact', '/api/listings'];
+  const publicApiPaths = ['/api/health', '/api/auth/login', '/api/auth/register', '/api/auth/logout', '/api/auth/refresh', '/api/auth/password-reset/request', '/api/auth/password-reset/confirm', '/api/auth/email-verification/confirm', '/api/auth/mfa/verify', '/api/contact', '/api/listings'];
   const publicInvitationPath = /^\/api\/tenant-invitations\/[a-f0-9]{64}(?:\/accept)?$/;
   app.use((req, res, next) => {
     if (req.path.startsWith('/api') && !publicApiPaths.includes(req.path) && !publicInvitationPath.test(req.path)) {
@@ -729,6 +927,23 @@ async function startServer() {
       });
 
       if (!result) return res.status(404).json({ success: false, error: 'Report not found.' });
+
+      await recordAudit({
+        actorId: user.sub,
+        actorEmail: user.email,
+        actorRole: user.role,
+        action: 'report.review',
+        targetType: 'report',
+        targetId: result.report.id,
+        summary: `Report set to ${status} (target ${result.report.targetType} ${result.report.targetId})`,
+        detail: {
+          status,
+          trustAdjustment: trustAdjustment ?? null,
+          blacklisted: blacklisted ?? null,
+          resolutionNoteProvided: Boolean(sanitizeString(resolutionNote)),
+        },
+      });
+
       return res.json({ success: true, ...result });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to update report.';
@@ -783,7 +998,7 @@ async function startServer() {
         },
       });
       const newUser: User = { ...dbUser, phone: dbUser.phone ?? undefined };
-      const token = createAuthToken(newUser);
+      const session = await issueSession(newUser, req.get('user-agent'));
       return res.status(201).json({
         success: true,
         user: {
@@ -802,7 +1017,7 @@ async function startServer() {
           incomeVerificationStatus: newUser.incomeVerificationStatus,
           payoutVerificationStatus: newUser.payoutVerificationStatus,
         },
-        token,
+        ...session,
       });
     } catch (error) {
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') {
@@ -841,21 +1056,64 @@ async function startServer() {
       return res.status(401).json({ success: false, error: 'Invalid email or password.' });
     }
 
-    const token = createAuthToken(user);
-    res.json({ success: true, user: serializeAccount(user), token });
+    // A second factor is challenged before any token is issued, so a stolen password alone stops here.
+    if (user.totpEnabledAt) {
+      const mfaToken = jwt.sign(
+        { sub: user.id, purpose: 'mfa' },
+        JWT_SECRET,
+        { expiresIn: MFA_TOKEN_TTL, jwtid: randomUUID() }
+      );
+      return res.json({ success: true, mfaRequired: true, mfaToken });
+    }
+
+    try {
+      const session = await issueSession(user, req.get('user-agent'));
+      return res.json({ success: true, user: serializeAccount(user), ...session });
+    } catch (error) {
+      console.error('Unable to start session:', error);
+      return res.status(503).json({ success: false, error: 'Account service is temporarily unavailable. Please try again shortly.' });
+    }
   });
 
-  app.post('/api/auth/logout', (req, res) => {
-    const authReq = req as AuthRequest;
-    const jti = authReq.user?.jti;
-    if (jti) tokenBlacklist.add(jti);
+  // Signing out is deliberately public: an expired access token must still be able to revoke its
+  // refresh token, otherwise a dead tab leaves a live session behind.
+  app.post('/api/auth/logout', async (req, res) => {
+    const authHeader = req.header('authorization');
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const payload = jwt.verify(authHeader.replace('Bearer ', '').trim(), JWT_SECRET) as any;
+        if (payload?.jti) tokenBlacklist.add(payload.jti);
+      } catch {
+        // Expired or malformed token: nothing to blacklist, the refresh token still gets revoked.
+      }
+    }
+
+    const refreshToken = sanitizeString(req.body?.refreshToken);
+    if (refreshToken) {
+      try {
+        await prisma.refreshToken.updateMany({
+          where: { tokenHash: hashToken(refreshToken), revokedAt: null },
+          data: { revokedAt: new Date(), revokedReason: 'logout' },
+        });
+      } catch (error) {
+        console.error('Unable to revoke session on logout:', error);
+        return res.status(503).json({ success: false, error: 'Sign-out could not be completed. Close the tab and try again.' });
+      }
+    }
+
     return res.json({ success: true, message: 'Logged out successfully.' });
   });
 
-  // Invalidate all tokens for the current user
-  app.post('/api/auth/logout-all', (req, res) => {
+  // Invalidate every session for the current user, in memory and in the database.
+  app.post('/api/auth/logout-all', async (req, res) => {
     const authReq = req as AuthRequest;
     if (!authReq.user) return res.status(401).json({ success: false, error: 'Not authenticated.' });
+    try {
+      await revokeAllSessions(authReq.user.sub, 'logout_all');
+    } catch (error) {
+      console.error('Unable to revoke all sessions:', error);
+      return res.status(503).json({ success: false, error: 'Sessions could not be revoked right now.' });
+    }
     revokedBefore[authReq.user.sub] = Date.now();
     return res.json({ success: true, message: 'All sessions for this user have been invalidated.' });
   });
@@ -879,6 +1137,7 @@ async function startServer() {
         data: { passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) },
       });
       revokedBefore[adminUser.id] = Date.now();
+      await revokeAllSessions(adminUser.id, 'password_rotated');
       return res.json({ success: true, message: 'Password updated. Sign in again with the new password.' });
     } catch (error) {
       console.error('Unable to rotate admin password:', error);
@@ -908,6 +1167,423 @@ async function startServer() {
       success: true,
       user: { id: sub, email, role, firstName, lastName, phone: null, avatarUrl: null },
     });
+  });
+
+  // Exchanging a refresh token rotates it: the presented token dies, a new one takes its place.
+  // Presenting an already-rotated token is treated as theft and drops every session for that user.
+  app.post('/api/auth/refresh', async (req, res) => {
+    const refreshToken = sanitizeString(req.body?.refreshToken);
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, error: 'A refresh token is required.' });
+    }
+
+    try {
+      const record = await prisma.refreshToken.findUnique({
+        where: { tokenHash: hashToken(refreshToken) },
+        include: { user: true },
+      });
+      if (!record) {
+        return res.status(401).json({ success: false, error: 'Session expired. Sign in again.' });
+      }
+      if (record.revokedAt) {
+        await revokeAllSessions(record.userId, 'token_reuse');
+        return res.status(401).json({ success: false, error: 'Session expired. Sign in again.' });
+      }
+      if (record.expiresAt.getTime() <= Date.now()) {
+        return res.status(401).json({ success: false, error: 'Session expired. Sign in again.' });
+      }
+
+      const nextToken = newOpaqueToken(48);
+      const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+      await prisma.$transaction([
+        prisma.refreshToken.update({
+          where: { id: record.id },
+          data: { revokedAt: new Date(), revokedReason: 'rotated' },
+        }),
+        prisma.refreshToken.create({
+          data: {
+            userId: record.userId,
+            tokenHash: hashToken(nextToken),
+            expiresAt,
+            userAgent: record.userAgent,
+          },
+        }),
+      ]);
+
+      const refreshed: User = { ...record.user, phone: record.user.phone ?? undefined };
+      return res.json({
+        success: true,
+        user: serializeAccount(refreshed),
+        token: createAuthToken(refreshed),
+        refreshToken: nextToken,
+        refreshTokenExpiresAt: expiresAt.toISOString(),
+      });
+    } catch (error) {
+      console.error('Unable to refresh session:', error);
+      return res.status(503).json({ success: false, error: 'Session service is temporarily unavailable.' });
+    }
+  });
+
+  app.get('/api/auth/sessions', async (req, res) => {
+    const authReq = req as AuthRequest;
+    if (!authReq.user) return res.status(401).json({ success: false, error: 'Not authenticated.' });
+    try {
+      const sessions = await prisma.refreshToken.findMany({
+        where: { userId: authReq.user.sub, revokedAt: null, expiresAt: { gt: new Date() } },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+        select: { id: true, createdAt: true, expiresAt: true, userAgent: true, revokedReason: true },
+      });
+      return res.json({
+        success: true,
+        data: sessions.map((session) => ({
+          id: session.id,
+          createdAt: session.createdAt.toISOString(),
+          expiresAt: session.expiresAt.toISOString(),
+          userAgent: session.userAgent,
+        })),
+      });
+    } catch (error) {
+      console.error('Unable to list sessions:', error);
+      return res.status(503).json({ success: false, error: 'Session list is temporarily unavailable.' });
+    }
+  });
+
+  // The response is identical whether or not the address exists, so this endpoint cannot be used to
+  // discover accounts. Without an email provider the link is written to the server log in development.
+  app.post('/api/auth/password-reset/request', async (req, res) => {
+    const email = sanitizeString(req.body?.email).toLowerCase();
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, error: 'Please provide a valid email address.' });
+    }
+
+    try {
+      const user = await prisma.user.findUnique({ where: { email } });
+      if (user) {
+        const token = newOpaqueToken(32);
+        await prisma.passwordResetToken.create({
+          data: {
+            userId: user.id,
+            tokenHash: hashToken(token),
+            expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MINUTES * 60 * 1000),
+          },
+        });
+        const link = `${appBaseUrl()}/reset-password?token=${token}`;
+        await deliverAccountLink(
+          email,
+          'password-reset',
+          link,
+          'Reset your PropManage password',
+          `Open this link within ${PASSWORD_RESET_TTL_MINUTES} minutes to choose a new password:\n\n${link}\n\nIf you did not ask for this, ignore this message. Nothing has changed.`
+        );
+      }
+      return res.json({ success: true, message: 'If that email has an account, a reset link is on its way.' });
+    } catch (error) {
+      console.error('Unable to start password reset:', error);
+      return res.status(503).json({ success: false, error: 'Password reset is temporarily unavailable.' });
+    }
+  });
+
+  app.post('/api/auth/password-reset/confirm', async (req, res) => {
+    const token = sanitizeString(req.body?.token);
+    const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+    if (!token || !newPassword) {
+      return res.status(400).json({ success: false, error: 'A reset token and a new password are required.' });
+    }
+    if (!isStrongPassword(newPassword)) {
+      return res.status(400).json({ success: false, error: 'Password must be 12-72 UTF-8 bytes long.' });
+    }
+
+    try {
+      const record = await prisma.passwordResetToken.findUnique({
+        where: { tokenHash: hashToken(token) },
+        include: { user: true },
+      });
+      if (!record || record.usedAt || record.expiresAt.getTime() <= Date.now()) {
+        return res.status(400).json({ success: false, error: 'This reset link is invalid or has expired. Request a new one.' });
+      }
+
+      const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+      await prisma.$transaction([
+        prisma.user.update({ where: { id: record.userId }, data: { passwordHash } }),
+        prisma.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
+        prisma.refreshToken.updateMany({
+          where: { userId: record.userId, revokedAt: null },
+          data: { revokedAt: new Date(), revokedReason: 'password_reset' },
+        }),
+      ]);
+
+      revokedBefore[record.userId] = Date.now();
+      return res.json({ success: true, message: 'Password updated. Sign in with the new password.' });
+    } catch (error) {
+      console.error('Unable to complete password reset:', error);
+      return res.status(503).json({ success: false, error: 'Password reset is temporarily unavailable.' });
+    }
+  });
+
+  app.post('/api/auth/email-verification/request', async (req, res) => {
+    const authReq = req as AuthRequest;
+    if (!authReq.user) return res.status(401).json({ success: false, error: 'Not authenticated.' });
+
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: authReq.user.sub },
+        select: { id: true, email: true, emailVerificationStatus: true },
+      });
+      if (!user) return res.status(404).json({ success: false, error: 'Account not found.' });
+      if (user.emailVerificationStatus === 'verified') {
+        return res.status(400).json({ success: false, error: 'This email is already verified.' });
+      }
+
+      const token = newOpaqueToken(32);
+      await prisma.emailVerificationToken.create({
+        data: {
+          userId: user.id,
+          tokenHash: hashToken(token),
+          expiresAt: new Date(Date.now() + EMAIL_VERIFICATION_TTL_HOURS * 60 * 60 * 1000),
+        },
+      });
+
+      const link = `${appBaseUrl()}/verify-email?token=${token}`;
+      const delivered = await deliverAccountLink(
+        user.email,
+        'email-verification',
+        link,
+        'Confirm your PropManage email',
+        `Confirm this address within ${EMAIL_VERIFICATION_TTL_HOURS} hours:\n\n${link}`
+      );
+      if (!delivered && process.env.NODE_ENV === 'production') {
+        return res.status(503).json({ success: false, error: 'Account email is not configured, so the confirmation link could not be sent.' });
+      }
+      return res.json({
+        success: true,
+        message: delivered
+          ? `Confirmation link sent to ${user.email}.`
+          : 'Development mode: the confirmation link was written to the server log.',
+      });
+    } catch (error) {
+      console.error('Unable to start email verification:', error);
+      return res.status(503).json({ success: false, error: 'Email verification is temporarily unavailable.' });
+    }
+  });
+
+  app.post('/api/auth/email-verification/confirm', async (req, res) => {
+    const token = sanitizeString(req.body?.token);
+    if (!token) return res.status(400).json({ success: false, error: 'A confirmation token is required.' });
+
+    try {
+      const record = await prisma.emailVerificationToken.findUnique({
+        where: { tokenHash: hashToken(token) },
+        include: { user: { select: { id: true, email: true, emailVerificationStatus: true } } },
+      });
+      if (!record || record.usedAt || record.expiresAt.getTime() <= Date.now()) {
+        return res.status(400).json({ success: false, error: 'This confirmation link is invalid or has expired.' });
+      }
+      if (record.user.emailVerificationStatus === 'verified') {
+        await prisma.emailVerificationToken.update({ where: { id: record.id }, data: { usedAt: new Date() } });
+        return res.json({ success: true, alreadyVerified: true, email: record.user.email, message: 'This email is already verified.' });
+      }
+
+      await prisma.$transaction([
+        prisma.user.update({
+          where: { id: record.userId },
+          data: { emailVerificationStatus: 'verified' },
+        }),
+        prisma.emailVerificationToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
+        prisma.verificationReview.create({
+          data: {
+            userId: record.userId,
+            field: 'email',
+            fromStatus: record.user.emailVerificationStatus,
+            toStatus: 'verified',
+            basis: 'Ownership confirmed by an emailed one-time link.',
+            reviewerId: record.userId,
+          },
+        }),
+      ]);
+
+      return res.json({ success: true, email: record.user.email, message: 'Email confirmed.' });
+    } catch (error) {
+      console.error('Unable to confirm email:', error);
+      return res.status(503).json({ success: false, error: 'Email confirmation is temporarily unavailable.' });
+    }
+  });
+
+  // Second factor is offered to platform staff only: they can reach every account on the platform.
+  app.get('/api/auth/mfa', async (req, res) => {
+    const authReq = req as AuthRequest;
+    if (!authReq.user) return res.status(401).json({ success: false, error: 'Not authenticated.' });
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: authReq.user.sub },
+        select: { role: true, totpSecret: true, totpEnabledAt: true, recoveryCodes: true },
+      });
+      if (!user) return res.status(404).json({ success: false, error: 'Account not found.' });
+      return res.json({
+        success: true,
+        data: {
+          available: user.role === 'admin',
+          enabled: Boolean(user.totpEnabledAt),
+          enabledAt: user.totpEnabledAt ? user.totpEnabledAt.toISOString() : null,
+          pendingSetup: Boolean(user.totpSecret) && !user.totpEnabledAt,
+          recoveryCodesRemaining: user.recoveryCodes.length,
+        },
+      });
+    } catch (error) {
+      console.error('Unable to load second factor state:', error);
+      return res.status(503).json({ success: false, error: 'Security settings are temporarily unavailable.' });
+    }
+  });
+
+  app.post('/api/auth/mfa/setup', requireRole('admin'), async (req, res) => {
+    const authReq = req as AuthRequest;
+    const actor = authReq.user!;
+
+    try {
+      const secret = base32Encode(randomBytes(20));
+      const recoveryCodes = generateRecoveryCodes();
+      await prisma.user.update({
+        where: { id: actor.sub },
+        data: {
+          totpSecret: secret,
+          totpEnabledAt: null,
+          recoveryCodes: recoveryCodes.map((code) => hashToken(code)),
+        },
+      });
+
+      const otpauthUrl = `otpauth://totp/${encodeURIComponent(`PropManage:${actor.email}`)}?secret=${secret}&issuer=PropManage&algorithm=SHA1&digits=6&period=${TOTP_STEP_SECONDS}`;
+      return res.json({
+        success: true,
+        data: {
+          secret,
+          otpauthUrl,
+          recoveryCodes,
+          message: 'Add the secret to an authenticator app, then confirm a code to switch it on.',
+        },
+      });
+    } catch (error) {
+      console.error('Unable to start second factor setup:', error);
+      return res.status(503).json({ success: false, error: 'Second factor setup is temporarily unavailable.' });
+    }
+  });
+
+  app.post('/api/auth/mfa/enable', requireRole('admin'), async (req, res) => {
+    const actor = (req as AuthRequest).user!;
+    const code = sanitizeString(req.body?.code);
+
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: actor.sub },
+        select: { totpSecret: true, totpEnabledAt: true },
+      });
+      if (!user?.totpSecret) {
+        return res.status(400).json({ success: false, error: 'Start setup before confirming a code.' });
+      }
+      if (user.totpEnabledAt) {
+        return res.status(400).json({ success: false, error: 'Two-factor authentication is already on.' });
+      }
+      if (!verifyTotp(user.totpSecret, code)) {
+        return res.status(400).json({ success: false, error: 'That code is not valid. Check the authenticator app and try again.' });
+      }
+
+      await prisma.user.update({ where: { id: actor.sub }, data: { totpEnabledAt: new Date() } });
+      await recordAudit({
+        actorId: actor.sub,
+        actorEmail: actor.email,
+        actorRole: actor.role,
+        action: 'mfa.enable',
+        targetType: 'account',
+        targetId: actor.sub,
+        summary: 'Two-factor authentication enabled',
+      });
+      return res.json({ success: true, message: 'Two-factor authentication is on.' });
+    } catch (error) {
+      console.error('Unable to enable second factor:', error);
+      return res.status(503).json({ success: false, error: 'Security settings are temporarily unavailable.' });
+    }
+  });
+
+  app.post('/api/auth/mfa/disable', requireRole('admin'), async (req, res) => {
+    const actor = (req as AuthRequest).user!;
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const code = sanitizeString(req.body?.code);
+
+    try {
+      const user = await prisma.user.findUnique({ where: { id: actor.sub } });
+      if (!user) return res.status(404).json({ success: false, error: 'Account not found.' });
+      if (!password || !(await bcrypt.compare(password, user.passwordHash))) {
+        return res.status(403).json({ success: false, error: 'Password is incorrect.' });
+      }
+
+      const codeValid = user.totpSecret ? verifyTotp(user.totpSecret, code) : false;
+      const recoveryValid = codeValid ? false : await consumeRecoveryCode(user.id, code);
+      if (!codeValid && !recoveryValid) {
+        return res.status(400).json({ success: false, error: 'Enter a current authenticator code or one of your recovery codes.' });
+      }
+
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { totpSecret: null, totpEnabledAt: null, recoveryCodes: [] },
+      });
+      await recordAudit({
+        actorId: actor.sub,
+        actorEmail: actor.email,
+        actorRole: actor.role,
+        action: 'mfa.disable',
+        targetType: 'account',
+        targetId: actor.sub,
+        summary: 'Two-factor authentication disabled',
+        detail: { usedRecoveryCode: recoveryValid },
+      });
+      return res.json({ success: true, message: 'Two-factor authentication is off.' });
+    } catch (error) {
+      console.error('Unable to disable second factor:', error);
+      return res.status(503).json({ success: false, error: 'Security settings are temporarily unavailable.' });
+    }
+  });
+
+  app.post('/api/auth/mfa/verify', async (req, res) => {
+    const mfaToken = sanitizeString(req.body?.mfaToken);
+    const code = sanitizeString(req.body?.code);
+    if (!mfaToken || !code) {
+      return res.status(400).json({ success: false, error: 'A sign-in ticket and a code are required.' });
+    }
+
+    let payload: any;
+    try {
+      payload = jwt.verify(mfaToken, JWT_SECRET);
+    } catch {
+      return res.status(401).json({ success: false, error: 'This sign-in attempt expired. Start again.' });
+    }
+    if (payload?.purpose !== 'mfa' || !payload?.sub) {
+      return res.status(401).json({ success: false, error: 'This sign-in ticket is not valid for two-factor verification.' });
+    }
+
+    try {
+      const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+      if (!user || !user.totpEnabledAt || !user.totpSecret) {
+        return res.status(401).json({ success: false, error: 'Sign in again.' });
+      }
+
+      const codeValid = verifyTotp(user.totpSecret, code);
+      const recoveryValid = codeValid ? false : await consumeRecoveryCode(user.id, code);
+      if (!codeValid && !recoveryValid) {
+        return res.status(401).json({ success: false, error: 'That code is not valid.' });
+      }
+
+      const account: User = { ...user, phone: user.phone ?? undefined };
+      const session = await issueSession(account, req.get('user-agent'));
+      return res.json({
+        success: true,
+        user: serializeAccount(account),
+        ...session,
+        usedRecoveryCode: recoveryValid,
+        recoveryCodesRemaining: account.recoveryCodes.length,
+      });
+    } catch (error) {
+      console.error('Unable to verify second factor:', error);
+      return res.status(503).json({ success: false, error: 'Sign-in is temporarily unavailable.' });
+    }
   });
 
   app.patch('/api/users/me', async (req, res) => {
@@ -1482,6 +2158,262 @@ async function startServer() {
     } catch (error) {
       console.error('Unable to load admin accounts:', error);
       return res.status(503).json({ success: false, error: 'The account directory is temporarily unavailable.' });
+    }
+  });
+
+  // Contact form submissions were written but nothing ever read them, so a message sent
+  // through the public contact form reached no one. This is the triage path for that queue.
+  const CONTACT_INQUIRY_STATUSES = ['new', 'handled', 'archived'];
+  const serializeInquiry = (inquiry: {
+    id: string; name: string; email: string; phone: string | null; reason: string; message: string;
+    status: string; createdAt: Date; updatedAt: Date;
+  }) => ({
+    id: inquiry.id,
+    name: inquiry.name,
+    email: inquiry.email,
+    phone: inquiry.phone,
+    reason: inquiry.reason,
+    message: inquiry.message,
+    status: inquiry.status,
+    createdAt: inquiry.createdAt.toISOString(),
+    updatedAt: inquiry.updatedAt.toISOString(),
+  });
+
+  app.get('/api/admin/contact-inquiries', requireRole('admin'), async (req, res) => {
+    const requestedStatus = typeof req.query.status === 'string' ? req.query.status : '';
+    const status = CONTACT_INQUIRY_STATUSES.includes(requestedStatus) ? requestedStatus : undefined;
+
+    try {
+      const [inquiries, grouped] = await Promise.all([
+        prisma.contactInquiry.findMany({
+          where: status ? { status } : undefined,
+          orderBy: { createdAt: 'desc' },
+          take: 200,
+        }),
+        prisma.contactInquiry.groupBy({ by: ['status'], _count: { _all: true } }),
+      ]);
+
+      const counts: Record<string, number> = { new: 0, handled: 0, archived: 0 };
+      for (const row of grouped) counts[row.status] = row._count._all;
+
+      return res.json({ success: true, data: inquiries.map(serializeInquiry), counts });
+    } catch (error) {
+      console.error('Unable to load contact enquiries:', error);
+      return res.status(503).json({ success: false, error: 'The contact enquiry inbox is temporarily unavailable.' });
+    }
+  });
+
+  app.patch('/api/admin/contact-inquiries/:id', requireRole('admin'), async (req, res) => {
+    const user = (req as AuthRequest).user;
+    if (!user) return res.status(401).json({ success: false, error: 'Authentication required.' });
+
+    const status = sanitizeString(req.body?.status);
+    if (!CONTACT_INQUIRY_STATUSES.includes(status)) {
+      return res.status(400).json({ success: false, error: 'Status must be new, handled, or archived.' });
+    }
+
+    try {
+      const existing = await prisma.contactInquiry.findUnique({
+        where: { id: req.params.id },
+        select: { id: true },
+      });
+      if (!existing) {
+        return res.status(404).json({ success: false, error: 'Enquiry not found.' });
+      }
+
+      const inquiry = await prisma.contactInquiry.update({
+        where: { id: existing.id },
+        data: { status },
+      });
+
+      await recordAudit({
+        actorId: user.sub,
+        actorEmail: user.email,
+        actorRole: user.role,
+        action: 'contact_enquiry.status',
+        targetType: 'contact_enquiry',
+        targetId: inquiry.id,
+        summary: `Contact enquiry moved to ${status}`,
+        detail: { status, reason: inquiry.reason },
+      });
+
+      return res.json({ success: true, inquiry: serializeInquiry(inquiry) });
+    } catch (error) {
+      console.error('Unable to update contact enquiry:', error);
+      return res.status(503).json({ success: false, error: 'The enquiry status could not be saved.' });
+    }
+  });
+
+  app.get('/api/admin/audit', requireRole('admin'), async (req, res) => {
+    const action = typeof req.query.action === 'string' ? req.query.action : '';
+
+    try {
+      const entries = await prisma.auditLog.findMany({
+        where: action ? { action } : undefined,
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      });
+
+      return res.json({
+        success: true,
+        data: entries.map((entry) => ({ ...entry, createdAt: entry.createdAt.toISOString() })),
+      });
+    } catch (error) {
+      console.error('Unable to load the audit log:', error);
+      return res.status(503).json({ success: false, error: 'The audit log is temporarily unavailable.' });
+    }
+  });
+
+  // Verification is recorded, never inferred. Every change names the admin who made it and the
+  // basis they relied on, because a "verified" badge with no reviewer behind it is a false claim.
+  const VERIFICATION_FIELDS: Record<string, keyof Pick<Prisma.UserSelect, 'identityVerificationStatus' | 'emailVerificationStatus' | 'phoneVerificationStatus' | 'propertyAuthorizationStatus' | 'businessRegistrationStatus' | 'incomeVerificationStatus' | 'payoutVerificationStatus'>> = {
+    identity: 'identityVerificationStatus',
+    email: 'emailVerificationStatus',
+    phone: 'phoneVerificationStatus',
+    property_authorization: 'propertyAuthorizationStatus',
+    business_registration: 'businessRegistrationStatus',
+    income: 'incomeVerificationStatus',
+    payout: 'payoutVerificationStatus',
+  };
+  const VERIFICATION_STATUSES = ['not_started', 'pending', 'needs_review', 'verified', 'rejected'];
+  const VERIFICATION_ACCOUNT_SELECT = {
+    id: true,
+    firstName: true,
+    lastName: true,
+    email: true,
+    role: true,
+    identityVerificationStatus: true,
+    emailVerificationStatus: true,
+    phoneVerificationStatus: true,
+    propertyAuthorizationStatus: true,
+    businessRegistrationStatus: true,
+    incomeVerificationStatus: true,
+    payoutVerificationStatus: true,
+  };
+
+  app.get('/api/admin/users/:id/verification', requireRole('admin'), async (req, res) => {
+    try {
+      const account = await prisma.user.findUnique({
+        where: { id: req.params.id },
+        select: VERIFICATION_ACCOUNT_SELECT,
+      });
+      if (!account) {
+        return res.status(404).json({ success: false, error: 'Account not found.' });
+      }
+
+      const reviews = await prisma.verificationReview.findMany({
+        where: { userId: account.id },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+        include: { reviewer: { select: { firstName: true, lastName: true, email: true } } },
+      });
+
+      return res.json({
+        success: true,
+        account,
+        reviews: reviews.map((review) => ({
+          id: review.id,
+          field: review.field,
+          fromStatus: review.fromStatus,
+          toStatus: review.toStatus,
+          basis: review.basis,
+          createdAt: review.createdAt.toISOString(),
+          reviewerName: `${review.reviewer.firstName} ${review.reviewer.lastName}`.trim(),
+          reviewerEmail: review.reviewer.email,
+        })),
+      });
+    } catch (error) {
+      console.error('Unable to load verification history:', error);
+      return res.status(503).json({ success: false, error: 'Verification history is temporarily unavailable.' });
+    }
+  });
+
+  app.post('/api/admin/users/:id/verification', requireRole('admin'), async (req, res) => {
+    const actor = (req as AuthRequest).user;
+    if (!actor) return res.status(401).json({ success: false, error: 'Authentication required.' });
+
+    const field = sanitizeString(req.body?.field);
+    const status = sanitizeString(req.body?.status);
+    const basis = sanitizeString(req.body?.basis);
+
+    const column = VERIFICATION_FIELDS[field];
+    if (!column) {
+      return res.status(400).json({ success: false, error: 'Unknown verification field.' });
+    }
+    if (!VERIFICATION_STATUSES.includes(status)) {
+      return res.status(400).json({ success: false, error: 'Status must be not_started, pending, needs_review, verified, or rejected.' });
+    }
+
+    const minimumBasis = status === 'verified' ? 25 : 10;
+    if (basis.length < minimumBasis || basis.length > 500) {
+      return res.status(400).json({
+        success: false,
+        error: status === 'verified'
+          ? 'Record what was actually checked before marking this verified (at least 25 characters).'
+          : 'Describe how this decision was reached (at least 10 characters).',
+      });
+    }
+
+    try {
+      const existing = await prisma.user.findUnique({
+        where: { id: req.params.id },
+        select: VERIFICATION_ACCOUNT_SELECT,
+      });
+      if (!existing) {
+        return res.status(404).json({ success: false, error: 'Account not found.' });
+      }
+
+      const fromStatus = existing[column];
+      if (fromStatus === status) {
+        return res.status(400).json({ success: false, error: 'That field already has this status.' });
+      }
+
+      const [updated, review] = await prisma.$transaction([
+        prisma.user.update({
+          where: { id: existing.id },
+          data: { [column]: status } as Prisma.UserUpdateInput,
+          select: VERIFICATION_ACCOUNT_SELECT,
+        }),
+        prisma.verificationReview.create({
+          data: {
+            userId: existing.id,
+            field,
+            fromStatus,
+            toStatus: status as Prisma.EnumVerificationStatusFieldUpdateOperationsInput['set'],
+            basis,
+            reviewerId: actor.sub,
+          },
+        }),
+      ]);
+
+      await recordAudit({
+        actorId: actor.sub,
+        actorEmail: actor.email,
+        actorRole: actor.role,
+        action: 'verification.record',
+        targetType: 'account',
+        targetId: existing.id,
+        summary: `${field} verification ${fromStatus} to ${status}`,
+        detail: { field, fromStatus, toStatus: status, reviewId: review.id },
+      });
+
+      return res.json({
+        success: true,
+        account: updated,
+        review: {
+          id: review.id,
+          field: review.field,
+          fromStatus: review.fromStatus,
+          toStatus: review.toStatus,
+          basis: review.basis,
+          createdAt: review.createdAt.toISOString(),
+          reviewerName: `${actor.firstName} ${actor.lastName}`.trim(),
+          reviewerEmail: actor.email,
+        },
+      });
+    } catch (error) {
+      console.error('Unable to record verification decision:', error);
+      return res.status(503).json({ success: false, error: 'The verification decision could not be saved.' });
     }
   });
 

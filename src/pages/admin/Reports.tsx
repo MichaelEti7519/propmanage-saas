@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Check, FileText, RefreshCw, Search, ShieldAlert } from 'lucide-react';
+import { AlertTriangle, Check, FileText, History, RefreshCw, Search, ShieldAlert } from 'lucide-react';
 import { useAuth } from '../../hooks/useAuth';
 
 type ReportStatus = 'open' | 'reviewing' | 'resolved' | 'dismissed';
@@ -27,6 +27,17 @@ interface ReportItem {
   } | null;
 }
 
+interface AuditEntry {
+  id: string;
+  actorEmail: string;
+  actorRole: string;
+  action: string;
+  targetType: string;
+  targetId: string | null;
+  summary: string;
+  createdAt: string;
+}
+
 const statuses: ReportStatus[] = ['open', 'reviewing', 'resolved', 'dismissed'];
 const statusText = (status: ReportStatus) => status.charAt(0).toUpperCase() + status.slice(1);
 const statusClass = (status: ReportStatus) => ({
@@ -50,6 +61,9 @@ export const AdminReports = () => {
   const [trustAdjustment, setTrustAdjustment] = useState('0');
   const [blacklisted, setBlacklisted] = useState(false);
   const [resolutionNote, setResolutionNote] = useState('');
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [auditLoading, setAuditLoading] = useState(true);
+  const [auditError, setAuditError] = useState<string | null>(null);
   const selected = reports.find((report) => report.id === selectedId) ?? null;
 
   useEffect(() => {
@@ -72,6 +86,25 @@ export const AdminReports = () => {
       }
     }
     loadReports();
+  }, [fetchWithAuth, refreshKey]);
+
+  useEffect(() => {
+    async function loadAudit() {
+      setAuditLoading(true);
+      setAuditError(null);
+      try {
+        const response = await fetchWithAuth('/api/admin/audit');
+        const data = await response.json();
+        if (!response.ok || !data?.success) throw new Error(data?.error || 'Unable to load the audit log.');
+        setAudit(Array.isArray(data.data) ? data.data : []);
+      } catch (loadError) {
+        setAudit([]);
+        setAuditError(loadError instanceof Error ? loadError.message : 'Unable to load the audit log.');
+      } finally {
+        setAuditLoading(false);
+      }
+    }
+    loadAudit();
   }, [fetchWithAuth, refreshKey]);
 
   useEffect(() => {
@@ -172,6 +205,45 @@ export const AdminReports = () => {
             </form> : <div className="flex min-h-80 flex-col items-center justify-center p-8 text-center"><FileText className="h-8 w-8 text-slate-300" /><p className="mt-3 font-semibold text-slate-800">Select a report to review</p><p className="mt-1 max-w-xs text-sm text-slate-500">Review the submitted information before changing case or account status.</p></div>}
           </section>
         </div>
+
+        <section className="border border-slate-200 bg-white shadow-sm">
+          <div className="flex flex-col gap-2 border-b border-slate-200 p-4 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <h2 className="flex items-center gap-2 font-bold text-slate-900"><History className="h-4 w-4 text-slate-500" /> Admin action log</h2>
+              <p className="mt-1 max-w-3xl text-xs text-slate-500">
+                Every report decision and contact enquiry triage records the acting admin account. The 100 most recent
+                entries are shown; report and enquiry text is deliberately not copied into the log.
+              </p>
+            </div>
+            <span className="shrink-0 text-xs text-slate-400">{audit.length} {audit.length === 1 ? 'entry' : 'entries'}</span>
+          </div>
+
+          {auditError ? (
+            <p role="alert" className="p-4 text-sm text-red-700">{auditError}</p>
+          ) : auditLoading ? (
+            <p className="p-6 text-center text-sm text-slate-500">Loading log...</p>
+          ) : audit.length === 0 ? (
+            <p className="p-6 text-center text-sm text-slate-500">No admin actions recorded yet.</p>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {audit.map((entry) => (
+                <li key={entry.id} className="flex flex-col gap-1 p-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 font-mono text-[11px] text-slate-700">{entry.action}</span>
+                      <span className="text-sm text-slate-800">{entry.summary}</span>
+                    </div>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {entry.actorEmail} · {entry.actorRole}
+                      {entry.targetId ? ` · ${entry.targetType} ${entry.targetId}` : ''}
+                    </p>
+                  </div>
+                  <span className="shrink-0 text-xs text-slate-500">{new Date(entry.createdAt).toLocaleString()}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
       </div>
     </div>
   );

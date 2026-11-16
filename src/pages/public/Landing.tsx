@@ -1,4 +1,4 @@
-import { Hero } from './landing/Hero';
+import { Hero, PhotoBand } from './landing/Hero';
 import { StorySection } from './landing/StorySection';
 import { WorkspaceSection } from './landing/WorkspaceSection';
 import { RolesSection } from './landing/RolesSection';
@@ -13,6 +13,7 @@ export function Landing() {
       <Hero />
       <StorySection />
       <WorkspaceSection />
+      <PhotoBand />
       <RolesSection />
       <WorkflowSection />
       <AvailabilitySection />
