@@ -2,6 +2,7 @@ import React from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   AlertCircle,
+  ArrowLeft,
   ArrowRight,
   Building2,
   Check,
@@ -9,6 +10,7 @@ import {
   EyeOff,
   Home,
   Info,
+  KeyRound,
   Loader2,
   ShieldCheck,
 } from 'lucide-react';
@@ -56,6 +58,9 @@ export function LoginRegister() {
   const [showPassword, setShowPassword] = React.useState(false);
   const [message, setMessage] = React.useState<{ type: 'error' | 'success'; text: string } | null>(null);
   const [isSubmitting, setIsSubmitting] = React.useState(false);
+  const [mfaToken, setMfaToken] = React.useState<string | null>(null);
+  const [mfaCode, setMfaCode] = React.useState('');
+  const [forgotOpen, setForgotOpen] = React.useState(false);
 
   React.useEffect(() => {
     setMessage(null);
@@ -68,17 +73,20 @@ export function LoginRegister() {
     setIsSubmitting(true);
     setMessage(null);
 
-    const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
-    const payload = isLogin
-      ? { email, password }
-      : {
-          firstName,
-          lastName,
-          email,
-          password,
-          role,
-          phone,
-        };
+    const verifying = Boolean(mfaToken);
+    const endpoint = verifying ? '/api/auth/mfa/verify' : isLogin ? '/api/auth/login' : '/api/auth/register';
+    const payload = verifying
+      ? { mfaToken, code: mfaCode.replace(/\s+/g, '') }
+      : isLogin
+        ? { email, password }
+        : {
+            firstName,
+            lastName,
+            email,
+            password,
+            role,
+            phone,
+          };
 
     try {
       const response = await fetch(endpoint, {
@@ -93,7 +101,16 @@ export function LoginRegister() {
         return;
       }
 
-      login(data.user, data.token);
+      // Once a second factor is on, the password only earns a five-minute ticket. Nothing is stored
+      // until the code checks out, so a stolen password alone still does not open the account.
+      if (data.mfaRequired && data.mfaToken) {
+        setMfaToken(data.mfaToken);
+        setMfaCode('');
+        setMessage({ type: 'success', text: 'Enter the 6-digit code from your authenticator app. A recovery code works too.' });
+        return;
+      }
+
+      login(data.user, data.token, data.refreshToken);
       const redirectPath = data.user.role === 'tenant' ? '/tenant' : data.user.role === 'landlord' ? '/landlord' : '/admin';
       navigate(redirectPath);
     } catch (error: any) {
@@ -102,6 +119,52 @@ export function LoginRegister() {
       setIsSubmitting(false);
     }
   };
+
+  const handleResetRequest = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setIsSubmitting(true);
+    setMessage(null);
+
+    try {
+      const response = await fetch('/api/auth/password-reset/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok || !data?.success) {
+        setMessage({ type: 'error', text: data?.error || 'The reset request could not be sent.' });
+        return;
+      }
+
+      setMessage({ type: 'success', text: data.message });
+    } catch {
+      setMessage({ type: 'error', text: 'Network error while requesting a reset link.' });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const messageBlock = message && (
+    <div
+      role={message.type === 'error' ? 'alert' : 'status'}
+      aria-live="polite"
+      className={[
+        'flex gap-2.5 rounded-xl px-3.5 py-3 text-[13px] leading-5',
+        message.type === 'error'
+          ? 'bg-[rgba(180,64,54,0.08)] text-[#8C332B]'
+          : 'bg-[rgba(57,116,81,0.1)] text-[#2C5B40]',
+      ].join(' ')}
+    >
+      {message.type === 'error' && <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />}
+      {message.text}
+    </div>
+  );
+
+  // The tabs are irrelevant once the user is mid-way through either secondary flow.
+  const showTabs = !mfaToken && !forgotOpen;
+  const formClassName = showTabs ? 'space-y-4' : 'mt-6 space-y-4';
 
   return (
     <div className="flex flex-1 flex-col bg-[#FAF8F3]">
@@ -146,20 +209,25 @@ export function LoginRegister() {
         <section className="w-full">
           <div className="mx-auto w-full max-w-[440px] rounded-[20px] border border-[#E8DDCC] bg-white p-6 shadow-[0_20px_50px_-34px_rgba(51,45,41,0.45)] sm:p-8">
             <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#397451]">
-              {isLogin ? 'Account access' : 'New workspace'}
+              {mfaToken ? 'Two-factor check' : forgotOpen ? 'Account recovery' : isLogin ? 'Account access' : 'New workspace'}
             </p>
 
             <h2 className="mt-2 font-display text-[26px] font-semibold leading-tight tracking-[-0.02em] text-[#332D29] sm:text-[28px]">
-              {isLogin ? 'Welcome back' : 'Create your account'}
+              {mfaToken ? 'One more step' : forgotOpen ? 'Reset your password' : isLogin ? 'Welcome back' : 'Create your account'}
             </h2>
 
             <p className="mt-2 text-sm leading-6 text-[#756B61]">
-              {isLogin
-                ? 'Sign in to pick up where you left off.'
-                : 'Takes a minute. Identity checks come later, only if you need them.'}
+              {mfaToken
+                ? 'Enter a code from your authenticator app to finish signing in.'
+                : forgotOpen
+                  ? 'We email a one-time link to the address on the account. Nothing changes until you use it.'
+                  : isLogin
+                    ? 'Sign in to pick up where you left off.'
+                    : 'Takes a minute. Identity checks come later, only if you need them.'}
             </p>
 
-            <div className="relative mt-6 mb-6 grid grid-cols-2 rounded-2xl bg-[#F2EEE6] p-1">
+            {showTabs && (
+              <div className="relative mt-6 mb-6 grid grid-cols-2 rounded-2xl bg-[#F2EEE6] p-1">
               <span
                 aria-hidden="true"
                 className={`absolute inset-y-1 left-1 w-[calc(50%-0.25rem)] rounded-xl bg-white shadow-[0_2px_8px_rgba(51,45,41,0.08)] ring-1 ring-[#E8DDCC]/70 transition-transform duration-300 ease-out motion-reduce:transition-none ${isLogin ? 'translate-x-0' : 'translate-x-full'}`}
@@ -180,9 +248,105 @@ export function LoginRegister() {
               >
                 Register
               </button>
-            </div>
+              </div>
+            )}
 
-            <form className="space-y-4" onSubmit={handleSubmit}>
+            {mfaToken ? (
+              <form className={formClassName} onSubmit={handleSubmit}>
+                <div>
+                  <label htmlFor="auth-mfa-code" className={labelClassName}>
+                    Authenticator code
+                  </label>
+                  <input
+                    id="auth-mfa-code"
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    autoFocus
+                    required
+                    value={mfaCode}
+                    onChange={(event) => setMfaCode(event.target.value)}
+                    placeholder="123456 or a recovery code"
+                    className={fieldClassName}
+                  />
+                  <p className="mt-1.5 text-xs leading-5 text-[#8A7E72]">
+                    Lost the app? Use one of the single-use recovery codes you saved when two-factor was switched on.
+                  </p>
+                </div>
+
+                {messageBlock}
+
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="mt-1 inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#332D29] px-5 text-sm font-semibold text-[#FAF8F3] transition-colors duration-200 hover:bg-[#397451] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#332D29] focus-visible:ring-offset-2 focus-visible:ring-offset-white disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+                  {isSubmitting ? 'Checking…' : 'Verify and sign in'}
+                </button>
+
+                <div className="pt-1 text-center text-[13px] text-[#756B61]">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMfaToken(null);
+                      setMfaCode('');
+                      setMessage(null);
+                    }}
+                    className={switchLinkClassName}
+                  >
+                    Use a different account
+                  </button>
+                </div>
+              </form>
+            ) : forgotOpen ? (
+              <form className={formClassName} onSubmit={handleResetRequest}>
+                <div>
+                  <label htmlFor="reset-email" className={labelClassName}>
+                    Email
+                  </label>
+                  <input
+                    id="reset-email"
+                    type="email"
+                    autoComplete="email"
+                    required
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="you@example.com"
+                    className={fieldClassName}
+                  />
+                  <p className="mt-1.5 text-xs leading-5 text-[#8A7E72]">
+                    The link expires in 60 minutes, works once, and the new password ends every other signed-in session.
+                  </p>
+                </div>
+
+                {messageBlock}
+
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="mt-1 inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#332D29] px-5 text-sm font-semibold text-[#FAF8F3] transition-colors duration-200 hover:bg-[#397451] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#332D29] focus-visible:ring-offset-2 focus-visible:ring-offset-white disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                  {isSubmitting ? 'Sending…' : 'Send reset link'}
+                </button>
+
+                <div className="pt-1 text-center text-[13px] text-[#756B61]">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setForgotOpen(false);
+                      setMessage(null);
+                    }}
+                    className={`inline-flex items-center gap-1.5 ${switchLinkClassName}`}
+                  >
+                    <ArrowLeft className="h-3.5 w-3.5" />
+                    Back to sign in
+                  </button>
+                </div>
+              </form>
+            ) : (
+            <form className={formClassName} onSubmit={handleSubmit}>
               {!isLogin && (
                 <div className="grid grid-cols-2 gap-3">
                   <div>
@@ -263,7 +427,20 @@ export function LoginRegister() {
                   <label htmlFor="auth-password" className={labelClassName}>
                     Password
                   </label>
-                  {!isLogin && <span className="mb-1.5 text-[11px] text-[#8A7E72]">12+ characters</span>}
+                  {isLogin ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setForgotOpen(true);
+                        setMessage(null);
+                      }}
+                      className="mb-1.5 text-[11px] font-semibold text-[#5E554D] underline decoration-[#B9A58B] underline-offset-2 transition-colors hover:text-[#397451]"
+                    >
+                      Forgot password?
+                    </button>
+                  ) : (
+                    <span className="mb-1.5 text-[11px] text-[#8A7E72]">12+ characters</span>
+                  )}
                 </div>
                 <div className="relative">
                   <input
@@ -331,21 +508,7 @@ export function LoginRegister() {
                 </div>
               )}
 
-              {message && (
-                <div
-                  role={message.type === 'error' ? 'alert' : 'status'}
-                  aria-live="polite"
-                  className={[
-                    'flex gap-2.5 rounded-xl px-3.5 py-3 text-[13px] leading-5',
-                    message.type === 'error'
-                      ? 'bg-[rgba(180,64,54,0.08)] text-[#8C332B]'
-                      : 'bg-[rgba(57,116,81,0.1)] text-[#2C5B40]',
-                  ].join(' ')}
-                >
-                  {message.type === 'error' && <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />}
-                  {message.text}
-                </div>
-              )}
+              {messageBlock}
 
               <button
                 type="submit"
@@ -375,6 +538,7 @@ export function LoginRegister() {
                 .
               </p>
             </form>
+            )}
           </div>
         </section>
       </div>

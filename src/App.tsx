@@ -4,6 +4,8 @@ import { PublicLayout } from './layouts/PublicLayout';
 import { DashboardLayout } from './layouts/DashboardLayout';
 import { Landing, About, Contact, LoginRegister, NotFound, Pricing, PrivacyPolicy, ThankYou } from './pages/public';
 import { TenantInvite } from './pages/public/TenantInvite';
+import { ResetPassword } from './pages/public/ResetPassword';
+import { VerifyEmail } from './pages/public/VerifyEmail';
 import { useAuth } from './hooks/useAuth';
 import { LandlordDashboard, LandlordProperties, LandlordUnits, LandlordPayments, LandlordReports, LandlordMessages, LandlordMaintenance, LandlordAnalytics,
   LandlordSettings} from './pages/landlord';
@@ -85,6 +87,8 @@ export default function App() {
           <Route path="/privacy" element={<PrivacyPolicy />} />
           <Route path="/thank-you" element={<ThankYou />} />
           <Route path="/login" element={<LoginRegister />} />
+          <Route path="/reset-password" element={<ResetPassword />} />
+          <Route path="/verify-email" element={<VerifyEmail />} />
           <Route path="/invite/:token" element={<TenantInvite />} />
           <Route path="*" element={<NotFound />} />
         </Route>

@@ -224,6 +224,9 @@ function serializeAccount(user: User) {
     phone: user.phone ?? null,
     role: user.role,
     avatarUrl: user.avatarUrl ?? null,
+    // Surfaced so the settings panel can say "pending" instead of guessing, and never claims a badge
+    // that no reviewer recorded.
+    emailVerificationStatus: user.emailVerificationStatus ?? 'not_started',
   };
 }
 function createAuthToken(user: User) {
@@ -1573,12 +1576,17 @@ async function startServer() {
 
       const account: User = { ...user, phone: user.phone ?? undefined };
       const session = await issueSession(account, req.get('user-agent'));
+      // A recovery code is deleted as it is used, so the count is re-read rather than taken from the
+      // snapshot loaded before verification.
+      const recoveryCodesRemaining = recoveryValid
+        ? (await prisma.user.findUnique({ where: { id: user.id }, select: { recoveryCodes: true } }))?.recoveryCodes.length ?? 0
+        : user.recoveryCodes.length;
       return res.json({
         success: true,
         user: serializeAccount(account),
         ...session,
         usedRecoveryCode: recoveryValid,
-        recoveryCodesRemaining: account.recoveryCodes.length,
+        recoveryCodesRemaining,
       });
     } catch (error) {
       console.error('Unable to verify second factor:', error);
@@ -1654,7 +1662,11 @@ async function startServer() {
         where: { id: authReq.user.sub },
         data: { passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) },
       });
-      return res.json({ success: true, message: 'Password updated.' });
+      // A password change ends every session: if the old password had leaked, the session it bought
+      // must not outlive the change.
+      await revokeAllSessions(authReq.user.sub, 'password_changed');
+      revokedBefore[authReq.user.sub] = Date.now();
+      return res.json({ success: true, message: 'Password updated. Sign in again with the new password.' });
     } catch (error) {
       console.error('Unable to change password:', error);
       return res.status(503).json({ success: false, error: 'Password service is temporarily unavailable.' });

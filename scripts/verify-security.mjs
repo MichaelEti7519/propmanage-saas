@@ -249,6 +249,27 @@ async function main() {
   const audits = await prisma.auditLog.findMany({ where: { actorId: admin.id, action: { in: ['mfa.enable', 'mfa.disable'] } }, select: { action: true } });
   check('enabling and disabling are both audited', audits.length === 2, audits);
 
+  // --- Password change revokes sessions ---------------------------------------------------------
+  const wrongCurrent = await call('/api/users/me/password', {
+    method: 'POST',
+    token: tenantLogin.json.token,
+    body: { currentPassword: 'Not-The-Password1', newPassword: 'Qa-Sec-Tenant-New!2026' },
+  });
+  check('changing a password needs the current password', wrongCurrent.status === 401, wrongCurrent);
+
+  const changed = await call('/api/users/me/password', {
+    method: 'POST',
+    token: tenantLogin.json.token,
+    body: { currentPassword: tenantPassword, newPassword: 'Qa-Sec-Tenant-New!2026' },
+  });
+  check('a password change succeeds for a non-admin account', changed.status === 200, changed);
+
+  const meAfterChange = await call('/api/auth/me', { token: tenantLogin.json.token });
+  check('a password change invalidates the access token', meAfterChange.status === 401, meAfterChange);
+
+  const refreshAfterChange = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: tenantLogin.json.refreshToken } });
+  check('a password change revokes the refresh token', refreshAfterChange.status === 401, refreshAfterChange);
+
   // --- Cleanup ---------------------------------------------------------------------------------
   const userIds = [admin.id, tenant.id];
   await prisma.auditLog.deleteMany({ where: { OR: [{ actorId: { in: userIds } }, { targetId: { in: userIds } }] } });

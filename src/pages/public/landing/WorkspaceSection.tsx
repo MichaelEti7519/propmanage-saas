@@ -96,10 +96,6 @@ function DashboardPreview() {
           </div>
           <StatusChip status="due" label="In progress" />
         </div>
-
-        <p className="mt-3 text-center text-[10px] text-[#8A7E72]">
-          Illustrative workspace · Sample data
-        </p>
       </div>
     </motion.div>
   );

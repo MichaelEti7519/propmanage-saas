@@ -6,7 +6,7 @@ import { propertyPhotos } from './sampleData';
 import { mutedLabel, pageShell, sampleBadge } from './theme';
 
 const facts = [
-  'Landlord, tenant and admin logins',
+  'Login as a Landlord or Tenat',
   'Rent status at a glance',
   'Invite tenants by private link',
 ];
@@ -52,7 +52,7 @@ function RentCycleCard() {
     <div className="w-full max-w-[290px] rounded-xl bg-white p-5 shadow-[0_18px_44px_-28px_rgba(0,0,0,0.6)]">
       <div className="flex items-center justify-between gap-3">
         <p className={mutedLabel}>Rent this cycle</p>
-        <span className={sampleBadge}>Sample</span>
+      
       </div>
 
       <p className="mt-2 flex items-baseline gap-2">
@@ -74,8 +74,8 @@ function RentCycleCard() {
       </div>
 
       <div className="mt-4 flex items-center justify-between border-t border-[#E8DDCC]/80 pt-3 text-[10px] text-[#8A7E72]">
-        <span>Adeniyi Court · 4 units</span>
-        <span>Bodija</span>
+        <span>Akpan Quarters · 4 units</span>
+        <span>Victor</span>
       </div>
     </div>
   );
@@ -272,9 +272,7 @@ export function Hero() {
               </motion.div>
             </div>
 
-            <p className="mt-8 text-[10px] uppercase tracking-[0.16em] text-white/45">
-              Illustrative building · Sample tenancy data
-            </p>
+            
           </div>
         </div>
       </section>
