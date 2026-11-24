@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
-import { ArrowUpRight, Building2, Menu, X } from 'lucide-react';
+import { ArrowUpRight, Menu, X } from 'lucide-react';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
+import { BrandMark } from '../components/BrandMark';
 
 const navLinks = [
   { name: 'Home', path: '/' },
@@ -110,9 +111,7 @@ export function PublicLayout() {
               aria-label="PropManage home"
               className="group flex shrink-0 items-center gap-2.5 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B]"
             >
-              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#332D29] text-[#E8DDCC] transition-transform duration-200 group-hover:scale-[1.04]">
-                <Building2 size={19} strokeWidth={1.8} />
-              </span>
+              <BrandMark size={36} className="transition-transform duration-200 group-hover:scale-[1.04]" />
 
               <span className="text-[17px] font-bold tracking-[-0.045em] sm:text-lg">
                 PropManage<span className="text-[#B9A58B]">.</span>
@@ -273,9 +272,7 @@ export function PublicLayout() {
                   to="/"
                   className="inline-flex items-center gap-2.5 rounded-lg text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#B9A58B]"
                 >
-                  <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/5">
-                    <Building2 size={19} className="text-[#B9A58B]" />
-                  </span>
+                  <BrandMark size={36} tone="light" />
 
                   <span className="text-lg font-bold tracking-tight">
                     PropManage<span className="text-[#B9A58B]">.</span>

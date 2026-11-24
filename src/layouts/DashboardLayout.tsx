@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { Menu, X, Building, Bell, Search } from 'lucide-react';
+import { Menu, X, Bell, Search } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion } from 'motion/react';
 import { useAuth } from '../hooks/useAuth';
+import { BrandMark } from '../components/BrandMark';
 
 interface NavItem {
   icon: React.ReactNode;
@@ -77,7 +78,7 @@ export function DashboardLayout({ children, navItems, userRole, userName, userEm
       )}>
         <div className="h-16 flex items-center justify-between px-6 border-b border-slate-800">
           <Link to="/" className="flex items-center">
-            <Building className="w-6 h-6 text-indigo-500 mr-2" />
+            <BrandMark size={32} className="mr-2" />
             <h1 className="font-bold text-white text-lg tracking-tight">PropManage</h1>
           </Link>
           <button 
