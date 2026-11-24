@@ -1,5 +1,5 @@
 import React from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate, Outlet } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom';
 import { PublicLayout } from './layouts/PublicLayout';
 import { DashboardLayout } from './layouts/DashboardLayout';
 import { Landing, About, Contact, LoginRegister, NotFound, Pricing, PrivacyPolicy, ThankYou } from './pages/public';
@@ -69,9 +69,13 @@ export default function App() {
   const { user, initializing } = useAuth();
 
   function RequireAuth({ children, allowedRoles }: { children: React.ReactNode; allowedRoles?: string[] }) {
+    const location = useLocation();
     if (initializing) return null;
     if (!user) return <Navigate to="/login" replace />;
     if (allowedRoles && !allowedRoles.includes(user.role)) return <Navigate to="/login" replace />;
+    if (user.role === 'admin' && !user.adminMfaEnabled && location.pathname !== '/admin/settings') {
+      return <Navigate to="/admin/settings" replace />;
+    }
     return <>{children}</>;
   }
 

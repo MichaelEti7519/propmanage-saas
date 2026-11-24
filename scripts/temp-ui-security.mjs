@@ -5,11 +5,29 @@ import bcrypt from 'bcryptjs';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 
-const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 const email = 'qa-ui-security@example.test';
 const password = 'Qa-UI-Security-Pass!2026';
 
 const mode = process.argv[2] ?? 'create';
+
+const databaseUrl = process.env.DATABASE_URL;
+if (process.env.NODE_ENV === 'production') {
+  throw new Error('This temporary QA helper is disabled in production.');
+}
+if (process.env.ALLOW_TEMP_QA_ADMIN !== 'true') {
+  throw new Error('Set ALLOW_TEMP_QA_ADMIN=true to run this destructive temporary QA helper.');
+}
+if (!databaseUrl) {
+  throw new Error('DATABASE_URL is required.');
+}
+const databaseHost = new URL(databaseUrl).hostname;
+if (!['localhost', '127.0.0.1', '::1'].includes(databaseHost)) {
+  throw new Error('This helper only runs against a loopback database.');
+}
+if (!['create', 'clean'].includes(mode)) {
+  throw new Error('Usage: node scripts/temp-ui-security.mjs create|clean');
+}
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: databaseUrl }) });
 
 if (mode === 'create') {
   const existing = await prisma.user.findUnique({ where: { email } });

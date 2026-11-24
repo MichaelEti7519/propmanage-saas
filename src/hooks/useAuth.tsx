@@ -11,6 +11,7 @@ export interface AuthUser {
   phone?: string | null;
   avatarUrl?: string | null;
   emailVerificationStatus?: VerificationStatus;
+  adminMfaEnabled?: boolean;
 }
 
 interface AuthContextValue {

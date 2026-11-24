@@ -81,7 +81,7 @@ function shortUserAgent(value: string | null) {
  * the list of live sessions. Everything here talks to the real endpoints — nothing is a mock switch.
  */
 export function SecuritySettings() {
-  const { user, fetchWithAuth, logout } = useAuth();
+  const { user, fetchWithAuth, logout, updateUser } = useAuth();
 
   const [emailNotice, setEmailNotice] = useState<{ type: 'ok' | 'error'; text: string } | null>(null);
   const [sendingEmail, setSendingEmail] = useState(false);
@@ -175,6 +175,7 @@ export function SecuritySettings() {
       const data = await response.json();
       if (!response.ok || !data?.success) throw new Error(data?.error || 'That code was not accepted.');
       setMfaNotice('Two-factor authentication is on. Keep the recovery codes somewhere safe.');
+      if (user?.role === 'admin') updateUser({ adminMfaEnabled: true });
       // The codes are shown once, at setup time; the panel keeps them visible until the page reloads.
       setEnableCode('');
       await loadMfa();
@@ -201,6 +202,7 @@ export function SecuritySettings() {
       setDisableOpen(false);
       setSetup(null);
       setMfaNotice('Two-factor authentication is off.');
+      if (user?.role === 'admin') updateUser({ adminMfaEnabled: false });
       await loadMfa();
     } catch (error) {
       setMfaError(error instanceof Error ? error.message : 'Two-factor authentication could not be switched off.');
@@ -301,7 +303,9 @@ export function SecuritySettings() {
             </h4>
             <p className={bodyClassName}>
               {mfa?.available
-                ? 'An authenticator app generates a six-digit code. With it on, a password alone cannot open your account.'
+                ? user?.role === 'admin'
+                  ? 'Required for every administrator. Until setup is complete, administrator features stay locked. Save your one-time recovery codes somewhere secure.'
+                  : 'An authenticator app generates a six-digit code. With it on, a password alone cannot open your account.'
                 : 'Offered to platform staff only, because those accounts can reach every workspace on the platform.'}
             </p>
           </div>

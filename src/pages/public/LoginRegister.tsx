@@ -111,7 +111,13 @@ export function LoginRegister() {
       }
 
       login(data.user, data.token, data.refreshToken);
-      const redirectPath = data.user.role === 'tenant' ? '/tenant' : data.user.role === 'landlord' ? '/landlord' : '/admin';
+      const redirectPath = data.user.role === 'tenant'
+        ? '/tenant'
+        : data.user.role === 'landlord'
+          ? '/landlord'
+          : data.mfaEnrollmentRequired
+            ? '/admin/settings'
+            : '/admin';
       navigate(redirectPath);
     } catch (error: any) {
       setMessage({ type: 'error', text: error?.message || 'Network error while authenticating.' });

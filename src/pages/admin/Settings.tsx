@@ -6,7 +6,7 @@ import { ProfileSettings } from '../../components/ProfileSettings';
 import { PasswordSettings, SecuritySettings } from '../../components/SecuritySettings';
 
 export const AdminSettings = () => {
-  const [activeTab, setActiveTab] = useState('profile');
+  const [activeTab, setActiveTab] = useState('security');
   const { isDarkMode, toggleDarkMode } = useDarkMode();
 
   return (

@@ -332,6 +332,7 @@ model RefreshToken {
   userId        String
   user          User      @relation("UserRefreshTokens", fields: [userId], references: [id], onDelete: Cascade)
   tokenHash     String    @unique
+  accessJti     String?   @unique
   expiresAt     DateTime
   revokedAt     DateTime?
   revokedReason String?
@@ -340,6 +341,15 @@ model RefreshToken {
 
   @@index([userId, createdAt])
   @@index([expiresAt])
+}
+
+/// Shared fixed-window counters used by all application instances for API rate limits.
+model RateLimitCounter {
+  key       String   @id
+  totalHits Int
+  resetAt   DateTime
+
+  @@index([resetAt])
 }
 
 /// Time-boxed, single-use password reset request. The token itself only ever exists in the link.

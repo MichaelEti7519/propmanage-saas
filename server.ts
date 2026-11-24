@@ -4,9 +4,9 @@ import cors from 'cors';
 import express from "express";
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
-import { createHash, createHmac, randomBytes, randomUUID } from 'crypto';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import { promises as fsp } from 'fs';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { type Store } from 'express-rate-limit';
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { fileURLToPath } from 'url';
@@ -197,9 +197,70 @@ function mapDbTenant(tenant: any): Tenant {
   };
 }
 
-// Token revocation and login protections (in-memory)
-const tokenBlacklist = new Set<string>();
-const revokedBefore: Record<string, number> = {};
+class PostgresRateLimitStore implements Store {
+  localKeys = false;
+  private windowMs = 60_000;
+  private cleanupTimer?: NodeJS.Timeout;
+
+  constructor(private readonly namespace: string) {}
+
+  init(options: { windowMs: number }) {
+    this.windowMs = options.windowMs;
+    if (!this.cleanupTimer) {
+      this.cleanupTimer = setInterval(() => {
+        prisma.$executeRaw`DELETE FROM "RateLimitCounter" WHERE "resetAt" < NOW() - INTERVAL '1 day'`
+          .catch((error) => console.error('Unable to prune old rate-limit counters:', error instanceof Error ? error.message : error));
+      }, 60 * 60 * 1000);
+      this.cleanupTimer.unref();
+    }
+  }
+
+  private storageKey(key: string) {
+    return `${this.namespace}:${key}`;
+  }
+
+  async get(key: string) {
+    const record = await prisma.rateLimitCounter.findUnique({ where: { key: this.storageKey(key) } });
+    if (!record || record.resetAt.getTime() <= Date.now()) return undefined;
+    return { totalHits: record.totalHits, resetTime: record.resetAt };
+  }
+
+  async increment(key: string) {
+    const storageKey = this.storageKey(key);
+    const rows = await prisma.$queryRaw<Array<{ totalHits: number; resetAt: Date }>>`
+      INSERT INTO "RateLimitCounter" ("key", "totalHits", "resetAt")
+      VALUES (${storageKey}, 1, NOW() + (${this.windowMs} * INTERVAL '1 millisecond'))
+      ON CONFLICT ("key") DO UPDATE SET
+        "totalHits" = CASE WHEN "RateLimitCounter"."resetAt" <= NOW() THEN 1 ELSE "RateLimitCounter"."totalHits" + 1 END,
+        "resetAt" = CASE WHEN "RateLimitCounter"."resetAt" <= NOW()
+          THEN NOW() + (${this.windowMs} * INTERVAL '1 millisecond')
+          ELSE "RateLimitCounter"."resetAt" END
+      RETURNING "totalHits", "resetAt"
+    `;
+    return { totalHits: rows[0].totalHits, resetTime: rows[0].resetAt };
+  }
+
+  async decrement(key: string) {
+    await prisma.$executeRaw`
+      UPDATE "RateLimitCounter"
+      SET "totalHits" = GREATEST("totalHits" - 1, 0)
+      WHERE "key" = ${this.storageKey(key)}
+    `;
+  }
+
+  async resetKey(key: string) {
+    await prisma.rateLimitCounter.deleteMany({ where: { key: this.storageKey(key) } });
+  }
+
+  async resetAll() {
+    const prefix = `${this.namespace}:`;
+    await prisma.$executeRaw`DELETE FROM "RateLimitCounter" WHERE left("key", ${prefix.length}) = ${prefix}`;
+  }
+
+  shutdown() {
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+  }
+}
 
 // Avatars are stored outside the bundle. The extension comes from the file signature
 // rather than the client's Content-Type, so a mislabelled upload cannot land as HTML.
@@ -224,6 +285,7 @@ function serializeAccount(user: User) {
     phone: user.phone ?? null,
     role: user.role,
     avatarUrl: user.avatarUrl ?? null,
+    adminMfaEnabled: user.role === 'admin' ? Boolean(user.totpEnabledAt) : undefined,
     // Surfaced so the settings panel can say "pending" instead of guessing, and never claims a badge
     // that no reviewer recorded.
     emailVerificationStatus: user.emailVerificationStatus ?? 'not_started',
@@ -251,6 +313,9 @@ const PASSWORD_RESET_TTL_MINUTES = 60;
 const EMAIL_VERIFICATION_TTL_HOURS = 24;
 const MFA_TOKEN_TTL = '5m';
 const TOTP_STEP_SECONDS = 30;
+let emailDeliveryState: 'unknown' | 'healthy' | 'degraded' = 'unknown';
+let emailLastEventAt: string | null = null;
+let emailLastEventType: string | null = null;
 
 function hashToken(token: string) {
   return createHash('sha256').update(token).digest('hex');
@@ -264,9 +329,12 @@ function appBaseUrl() {
   return (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
 }
 
-async function sendAccountEmail(to: string, subject: string, text: string) {
+async function sendAccountEmail(to: string, subject: string, text: string, html?: string) {
   const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) return false;
+  if (!apiKey) {
+    emailDeliveryState = 'degraded';
+    return false;
+  }
   try {
     const response = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -276,17 +344,48 @@ async function sendAccountEmail(to: string, subject: string, text: string) {
         to,
         subject,
         text,
+        ...(html ? { html } : {}),
       }),
     });
-    return response.ok;
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      emailDeliveryState = 'degraded';
+      console.error('Account email provider rejected a message:', JSON.stringify({ status: response.status, subject, providerCode: result?.name ?? 'unknown error' }));
+      return false;
+    }
+    emailDeliveryState = 'healthy';
+    emailLastEventAt = new Date().toISOString();
+    emailLastEventType = 'email.sent';
+    console.info('Account email accepted by provider:', JSON.stringify({ subject, providerId: result?.id ?? null }));
+    return true;
   } catch (error) {
-    console.error('Unable to send account email:', error);
+    emailDeliveryState = 'degraded';
+    console.error('Account email delivery request failed:', error instanceof Error ? error.message : 'network error');
     return false;
   }
 }
 
-// The link is only ever logged outside production. In production it must travel by email, otherwise
-// the request endpoint reports success and no link exists — which is honest, not silently broken.
+function isValidResendWebhook(req: express.Request) {
+  const secret = process.env.RESEND_WEBHOOK_SECRET?.replace(/^whsec_/, '');
+  const messageId = req.header('svix-id') ?? '';
+  const timestamp = req.header('svix-timestamp') ?? '';
+  const signatureHeader = req.header('svix-signature') ?? '';
+  if (!secret || !messageId || !/^\d+$/.test(timestamp) || !signatureHeader) return false;
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
+  if (!Buffer.isBuffer(req.body)) return false;
+
+  const signedContent = `${messageId}.${timestamp}.${req.body.toString('utf8')}`;
+  const expected = createHmac('sha256', Buffer.from(secret, 'base64')).update(signedContent).digest();
+  return signatureHeader.split(' ').some((entry) => {
+    const [version, encoded] = entry.split(',', 2);
+    if (version !== 'v1' || !encoded) return false;
+    const supplied = Buffer.from(encoded, 'base64');
+    return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+  });
+}
+
+// The link is only logged outside production. Production startup requires Resend credentials.
+// Provider rejections are logged without exposing recipient addresses or reset tokens.
 async function deliverAccountLink(email: string, label: string, link: string, subject: string, text: string) {
   const sent = await sendAccountEmail(email, subject, text);
   if (!sent && process.env.NODE_ENV !== 'production') {
@@ -401,7 +500,7 @@ async function consumeRecoveryCode(userId: string, code: string) {
   return true;
 }
 
-function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
+async function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
   const authHeader = req.header('authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ success: false, error: 'Authorization token is required.' });
@@ -429,9 +528,42 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
       exp: payload.exp,
       jti: payload.jti,
     };
+
+    // Admins without MFA can only reach the enrollment and basic account endpoints. This lets
+    // bootstrap admins enroll their authenticator while every privileged API stays locked.
+    if (payload.role === 'admin') {
+      const account = await prisma.user.findUnique({
+        where: { id: payload.sub },
+        select: { role: true, totpEnabledAt: true },
+      });
+      if (!account || account.role !== 'admin') {
+        return res.status(401).json({ success: false, error: 'Administrator account is unavailable.' });
+      }
+      const mfaEnrollmentPaths = new Set([
+        '/api/auth/me',
+        '/api/auth/sessions',
+        '/api/auth/logout-all',
+        '/api/auth/email-verification/request',
+        '/api/auth/mfa',
+        '/api/auth/mfa/setup',
+        '/api/auth/mfa/enable',
+        '/api/auth/mfa/disable',
+      ]);
+      if (!account.totpEnabledAt && !mfaEnrollmentPaths.has(req.path)) {
+        return res.status(403).json({
+          success: false,
+          code: 'ADMIN_MFA_REQUIRED',
+          error: 'Set up authenticator-based two-factor authentication before using administrator features.',
+        });
+      }
+    }
     return next();
   } catch (error: any) {
-    return res.status(401).json({ success: false, error: 'Invalid or expired token.' });
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired token.' });
+    }
+    console.error('Unable to enforce administrator MFA:', error);
+    return res.status(503).json({ success: false, error: 'Account security is temporarily unavailable.' });
   }
 }
 
@@ -581,6 +713,12 @@ function createId(prefix = 'id') {
 }
 
 async function startServer() {
+  if (process.env.NODE_ENV === 'production') {
+    const sender = process.env.EMAIL_FROM?.trim() ?? '';
+    if (!process.env.RESEND_API_KEY || !sender || /onboarding@resend\.dev/i.test(sender) || !process.env.RESEND_WEBHOOK_SECRET) {
+      throw new Error('Production email requires RESEND_API_KEY, a verified EMAIL_FROM sender, and RESEND_WEBHOOK_SECRET.');
+    }
+  }
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
 
@@ -621,6 +759,8 @@ async function startServer() {
     credentials: true,
   }));
 
+  // Keep the provider webhook's exact bytes available for signature verification.
+  app.use('/api/webhooks/resend', express.raw({ type: 'application/json', limit: '256kb' }));
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ limit: '32kb', extended: true }));
 
@@ -679,7 +819,7 @@ async function startServer() {
   app.use('/api', apiLimiter);
   app.use('/api/auth', authLimiter);
 
-  const publicApiPaths = ['/api/health', '/api/auth/login', '/api/auth/register', '/api/auth/logout', '/api/auth/refresh', '/api/auth/password-reset/request', '/api/auth/password-reset/confirm', '/api/auth/email-verification/confirm', '/api/auth/mfa/verify', '/api/contact', '/api/listings'];
+  const publicApiPaths = ['/api/health', '/api/webhooks/resend', '/api/auth/login', '/api/auth/register', '/api/auth/logout', '/api/auth/refresh', '/api/auth/password-reset/request', '/api/auth/password-reset/confirm', '/api/auth/email-verification/confirm', '/api/auth/mfa/verify', '/api/contact', '/api/listings'];
   const publicInvitationPath = /^\/api\/tenant-invitations\/[a-f0-9]{64}(?:\/accept)?$/;
   app.use((req, res, next) => {
     if (req.path.startsWith('/api') && !publicApiPaths.includes(req.path) && !publicInvitationPath.test(req.path)) {
@@ -689,7 +829,40 @@ async function startServer() {
   });
 
   app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+    const emailConfigured = Boolean(
+      process.env.RESEND_API_KEY
+      && (process.env.EMAIL_FROM || process.env.NODE_ENV !== 'production')
+      && process.env.RESEND_WEBHOOK_SECRET
+    );
+    res.json({
+      status: emailDeliveryState === 'degraded' ? 'degraded' : 'ok',
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+      email: { configured: emailConfigured, delivery: emailDeliveryState, lastEvent: emailLastEventType, lastEventAt: emailLastEventAt },
+    });
+  });
+
+  app.post('/api/webhooks/resend', (req, res) => {
+    if (!isValidResendWebhook(req)) {
+      return res.status(401).json({ success: false, error: 'Invalid email provider signature.' });
+    }
+    let event: any;
+    try {
+      event = JSON.parse((req.body as Buffer).toString('utf8'));
+    } catch {
+      return res.status(400).json({ success: false, error: 'Invalid email provider event.' });
+    }
+    const eventType = sanitizeString(event?.type);
+    const trackedTypes = new Set(['email.sent', 'email.delivered', 'email.delivery_delayed', 'email.bounced', 'email.failed', 'email.suppressed', 'email.complained']);
+    if (!trackedTypes.has(eventType)) return res.json({ success: true, ignored: true });
+
+    emailLastEventAt = new Date().toISOString();
+    emailLastEventType = eventType;
+    emailDeliveryState = ['email.delivery_delayed', 'email.bounced', 'email.failed', 'email.suppressed', 'email.complained'].includes(eventType)
+      ? 'degraded'
+      : 'healthy';
+    console.info('Resend delivery event:', JSON.stringify({ type: eventType, emailId: event?.data?.email_id ?? null }));
+    return res.json({ success: true });
   });
 
   app.post('/api/contact', async (req, res) => {
@@ -1071,7 +1244,12 @@ async function startServer() {
 
     try {
       const session = await issueSession(user, req.get('user-agent'));
-      return res.json({ success: true, user: serializeAccount(user), ...session });
+      return res.json({
+        success: true,
+        user: serializeAccount(user),
+        ...session,
+        mfaEnrollmentRequired: user.role === 'admin',
+      });
     } catch (error) {
       console.error('Unable to start session:', error);
       return res.status(503).json({ success: false, error: 'Account service is temporarily unavailable. Please try again shortly.' });
@@ -1280,7 +1458,10 @@ async function startServer() {
           `Open this link within ${PASSWORD_RESET_TTL_MINUTES} minutes to choose a new password:\n\n${link}\n\nIf you did not ask for this, ignore this message. Nothing has changed.`
         );
       }
-      return res.json({ success: true, message: 'If that email has an account, a reset link is on its way.' });
+      return res.json({
+        success: true,
+        message: 'If that email has an account, a reset email will be sent when delivery is available. If it does not arrive, contact support through the Contact page.',
+      });
     } catch (error) {
       console.error('Unable to start password reset:', error);
       return res.status(503).json({ success: false, error: 'Password reset is temporarily unavailable.' });
@@ -1803,27 +1984,12 @@ async function startServer() {
 
       const appUrl = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
       const inviteUrl = `${appUrl}/invite/${token}`;
-      let emailSent = false;
-      if (process.env.RESEND_API_KEY) {
-        try {
-          const emailResponse = await fetch('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              from: process.env.EMAIL_FROM || 'PropManage <onboarding@resend.dev>',
-              to: [email],
-              subject: 'You are invited to your tenant portal',
-              html: `<p>You have been invited to join your tenant portal.</p><p><a href="${inviteUrl}">Review invitation</a></p><p>This link expires in 7 days.</p>`,
-            }),
-          });
-          emailSent = emailResponse.ok;
-        } catch {
-          emailSent = false;
-        }
-      }
+      const emailSent = await sendAccountEmail(
+        email,
+        'You are invited to your tenant portal',
+        `You have been invited to join your tenant portal. Review the invitation within 7 days: ${inviteUrl}`,
+        `<p>You have been invited to join your tenant portal.</p><p><a href="${inviteUrl}">Review invitation</a></p><p>This link expires in 7 days.</p>`,
+      );
 
       return {
         type: 'success',
@@ -3779,6 +3945,14 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
+    // The dist folder also contains the Node server bundle. Never serve executable
+    // server artifacts or source maps as public static files.
+    app.use((req, res, next) => {
+      if (/\.(?:cjs|map)$/i.test(req.path)) {
+        return res.status(404).end();
+      }
+      next();
+    });
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
