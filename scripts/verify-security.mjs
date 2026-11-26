@@ -28,22 +28,34 @@ function check(name, condition, detail) {
   }
 }
 
-async function call(path, { method = 'GET', body, token } = {}) {
+async function call(path, { method = 'GET', body, client } = {}) {
   const headers = {};
+  headers.Origin = process.env.VERIFY_ORIGIN || 'http://localhost:3000';
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  if (token) headers.Authorization = `Bearer ${token}`;
+  if (client?.cookies?.size) headers.Cookie = [...client.cookies].map(([name, value]) => `${name}=${value}`).join('; ');
   const response = await fetch(`${BASE}${path}`, {
     method,
     headers,
+    credentials: 'include',
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  const setCookies = response.headers.getSetCookie?.() ?? [response.headers.get('set-cookie')].filter(Boolean);
+  for (const line of setCookies) {
+    const [cookiePair, ...attributes] = line.split(';');
+    const separator = cookiePair.indexOf('=');
+    if (separator < 0) continue;
+    const name = cookiePair.slice(0, separator);
+    const value = cookiePair.slice(separator + 1);
+    if (attributes.some((attribute) => /^\s*max-age=0\s*$/i.test(attribute))) client?.cookies?.delete(name);
+    else client?.cookies?.set(name, value);
+  }
   let json = null;
   try {
     json = await response.json();
   } catch {
     json = null;
   }
-  return { status: response.status, json };
+  return { status: response.status, json, client };
 }
 
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
@@ -74,7 +86,8 @@ function totp(secret, offsetSteps = 0) {
 }
 
 async function login(email, password) {
-  return call('/api/auth/login', { method: 'POST', body: { email, password } });
+  const client = { cookies: new Map() };
+  return call('/api/auth/login', { method: 'POST', body: { email, password }, client });
 }
 
 async function main() {
@@ -95,34 +108,39 @@ async function main() {
 
   // --- Session issuance and rotation -----------------------------------------------------------
   const first = await login(adminEmail, oldPassword);
-  check('login returns an access token and a refresh token', first.status === 200 && Boolean(first.json?.token) && Boolean(first.json?.refreshToken), first.json);
+  check('login sets HttpOnly access and refresh cookies without returning tokens', first.status === 200 && first.client.cookies.size === 2 && !first.json?.token && !first.json?.refreshToken, first.json);
+  const firstRefreshCookie = first.client.cookies.get('__Host-propmanage_refresh') ?? first.client.cookies.get('propmanage_refresh');
   check('login returns a refresh expiry about 30 days out', (() => {
     const ms = new Date(first.json?.refreshTokenExpiresAt || 0).getTime() - Date.now();
     return ms > 29 * 864e5 && ms < 31 * 864e5;
   })(), first.json?.refreshTokenExpiresAt);
 
-  const rotated = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: first.json.refreshToken } });
-  check('refresh rotates the token and mints a new access token', rotated.status === 200 && rotated.json.refreshToken !== first.json.refreshToken && Boolean(rotated.json.token), rotated.json);
+  const rotated = await call('/api/auth/refresh', { method: 'POST', client: first.client });
+  const rotatedRefreshCookie = first.client.cookies.get('__Host-propmanage_refresh') ?? first.client.cookies.get('propmanage_refresh');
+  check('refresh rotates both HttpOnly cookies without returning tokens', rotated.status === 200 && rotatedRefreshCookie !== firstRefreshCookie && !rotated.json.token && !rotated.json.refreshToken, rotated.json);
 
-  const reuse = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: first.json.refreshToken } });
+  const replayClient = { cookies: new Map(first.client.cookies) };
+  replayClient.cookies.set('__Host-propmanage_refresh', firstRefreshCookie);
+  replayClient.cookies.set('propmanage_refresh', firstRefreshCookie);
+  const reuse = await call('/api/auth/refresh', { method: 'POST', client: replayClient });
   check('replaying a rotated refresh token is rejected', reuse.status === 401, reuse);
 
-  const familyAfterReuse = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: rotated.json.refreshToken } });
+  const familyAfterReuse = await call('/api/auth/refresh', { method: 'POST', client: first.client });
   check('replay revokes the whole token family', familyAfterReuse.status === 401, familyAfterReuse);
 
   const second = await login(adminEmail, oldPassword);
-  const liveSessions = await call('/api/auth/sessions', { token: second.json.token });
+  const liveSessions = await call('/api/auth/sessions', { client: second.client });
   check('sessions endpoint lists the live session', liveSessions.status === 200 && liveSessions.json.data.length === 1, liveSessions.json);
 
-  const loggedOut = await call('/api/auth/logout', { method: 'POST', body: { refreshToken: second.json.refreshToken } });
-  const afterLogout = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: second.json.refreshToken } });
+  const loggedOut = await call('/api/auth/logout', { method: 'POST', client: second.client });
+  const afterLogout = await call('/api/auth/refresh', { method: 'POST', client: second.client });
   check('logout revokes the refresh token', loggedOut.status === 200 && afterLogout.status === 401, { loggedOut, afterLogout });
 
   const third = await login(adminEmail, oldPassword);
-  await call('/api/auth/logout-all', { method: 'POST', token: third.json.token });
-  const sessionsAfterAll = await call('/api/auth/sessions', { method: 'GET', token: third.json.token });
-  const refreshAfterAll = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: third.json.refreshToken } });
-  check('logout-all revokes every session', refreshAfterAll.status === 401, { refreshAfterAll });
+  await call('/api/auth/logout-all', { method: 'POST', client: third.client });
+  const sessionsAfterAll = await call('/api/auth/sessions', { method: 'GET', client: third.client });
+  const refreshAfterAll = await call('/api/auth/refresh', { method: 'POST', client: third.client });
+  check('logout-all revokes access and refresh sessions across requests', sessionsAfterAll.status === 401 && refreshAfterAll.status === 401, { sessionsAfterAll, refreshAfterAll });
 
   const wrongPassword = await login(adminEmail, 'Definitely-Not-The-Password1');
   check('a wrong password is rejected', wrongPassword.status === 401, wrongPassword);
@@ -151,7 +169,7 @@ async function main() {
   const oldLogin = await login(adminEmail, oldPassword);
   const newLogin = await login(adminEmail, newPassword);
   check('the old password stops working after a reset', oldLogin.status === 401, oldLogin);
-  check('the new password works after a reset', newLogin.status === 200 && Boolean(newLogin.json.token), newLogin);
+  check('the new password works after a reset', newLogin.status === 200 && newLogin.client.cookies.size === 2, newLogin);
 
   const resetSessions = await prisma.refreshToken.count({ where: { userId: admin.id, revokedAt: null } });
   check('a password reset leaves exactly one live session (the new login)', resetSessions === 1, resetSessions);
@@ -162,7 +180,7 @@ async function main() {
 
   // --- Email verification ----------------------------------------------------------------------
   const tenantLogin = await login(tenantEmail, tenantPassword);
-  const verifyRequest = await call('/api/auth/email-verification/request', { method: 'POST', token: tenantLogin.json.token });
+  const verifyRequest = await call('/api/auth/email-verification/request', { method: 'POST', client: tenantLogin.client });
   check('email verification request succeeds for an unverified account', verifyRequest.status === 200, verifyRequest);
 
   const rawVerify = crypto.randomBytes(32).toString('base64url');
@@ -179,69 +197,69 @@ async function main() {
   const review = await prisma.verificationReview.findFirst({ where: { userId: tenant.id, field: 'email' } });
   check('email confirmation writes an accountable review row', Boolean(review) && review.reviewerId === tenant.id && review.toStatus === 'verified', review);
 
-  const verifyAgain = await call('/api/auth/email-verification/request', { method: 'POST', token: tenantLogin.json.token });
+  const verifyAgain = await call('/api/auth/email-verification/request', { method: 'POST', client: tenantLogin.client });
   check('a verified address is not asked to verify twice', verifyAgain.status === 400, verifyAgain);
 
   const anonVerifyRequest = await call('/api/auth/email-verification/request', { method: 'POST' });
   check('email verification request requires a session', anonVerifyRequest.status === 401, anonVerifyRequest);
 
   // --- Second factor ----------------------------------------------------------------------------
-  const tenantMfa = await call('/api/auth/mfa', { token: tenantLogin.json.token });
+  const tenantMfa = await call('/api/auth/mfa', { client: tenantLogin.client });
   check('second factor is not offered to tenants', tenantMfa.status === 200 && tenantMfa.json.data.available === false, tenantMfa.json);
 
-  const tenantSetup = await call('/api/auth/mfa/setup', { method: 'POST', token: tenantLogin.json.token });
+  const tenantSetup = await call('/api/auth/mfa/setup', { method: 'POST', client: tenantLogin.client });
   check('tenants cannot start second factor setup', tenantSetup.status === 403, tenantSetup);
 
   const adminLogin = await login(adminEmail, newPassword);
-  const adminMfaBefore = await call('/api/auth/mfa', { token: adminLogin.json.token });
+  const adminMfaBefore = await call('/api/auth/mfa', { client: adminLogin.client });
   check('admin starts with no second factor', adminMfaBefore.status === 200 && adminMfaBefore.json.data.enabled === false, adminMfaBefore.json);
 
-  const setup = await call('/api/auth/mfa/setup', { method: 'POST', token: adminLogin.json.token });
+  const setup = await call('/api/auth/mfa/setup', { method: 'POST', client: adminLogin.client });
   const secret = setup.json?.data?.secret;
   const recoveryCodes = setup.json?.data?.recoveryCodes ?? [];
   check('setup returns a base32 secret, an otpauth URI, and 8 recovery codes', setup.status === 200 && /^[A-Z2-7]{16,}$/.test(secret || '') && setup.json.data.otpauthUrl.startsWith('otpauth://totp/') && recoveryCodes.length === 8, { secret, count: recoveryCodes.length });
 
-  const pendingState = await call('/api/auth/mfa', { token: adminLogin.json.token });
+  const pendingState = await call('/api/auth/mfa', { client: adminLogin.client });
   check('an unfinished setup is reported as pending, not enabled', pendingState.json.data.pendingSetup === true && pendingState.json.data.enabled === false, pendingState.json);
 
-  const wrongEnable = await call('/api/auth/mfa/enable', { method: 'POST', token: adminLogin.json.token, body: { code: '000000' } });
+  const wrongEnable = await call('/api/auth/mfa/enable', { method: 'POST', client: adminLogin.client, body: { code: '000000' } });
   check('a wrong code cannot switch the second factor on', wrongEnable.status === 400, wrongEnable);
 
-  const enable = await call('/api/auth/mfa/enable', { method: 'POST', token: adminLogin.json.token, body: { code: totp(secret) } });
+  const enable = await call('/api/auth/mfa/enable', { method: 'POST', client: adminLogin.client, body: { code: totp(secret) } });
   check('a valid code switches the second factor on', enable.status === 200, enable);
 
-  const enabledState = await call('/api/auth/mfa', { token: adminLogin.json.token });
+  const enabledState = await call('/api/auth/mfa', { client: adminLogin.client });
   check('second factor state reports enabled with 8 recovery codes', enabledState.json.data.enabled === true && enabledState.json.data.recoveryCodesRemaining === 8, enabledState.json);
 
   const challengedLogin = await login(adminEmail, newPassword);
-  check('password login now stops at the second factor', challengedLogin.status === 200 && challengedLogin.json.mfaRequired === true && Boolean(challengedLogin.json.mfaToken) && !challengedLogin.json.token, challengedLogin.json);
+  check('password login now stops at the second factor', challengedLogin.status === 200 && challengedLogin.json.mfaRequired === true && Boolean(challengedLogin.json.mfaToken) && challengedLogin.client.cookies.size === 0, challengedLogin.json);
 
   const wrongCode = await call('/api/auth/mfa/verify', { method: 'POST', body: { mfaToken: challengedLogin.json.mfaToken, code: '111111' } });
   check('a wrong second factor code is rejected', wrongCode.status === 401, wrongCode);
 
-  const wrongPurpose = await call('/api/auth/mfa/verify', { method: 'POST', body: { mfaToken: adminLogin.json.token, code: totp(secret) } });
-  check('an ordinary access token cannot be used as a sign-in ticket', wrongPurpose.status === 401, wrongPurpose);
+  const wrongPurpose = await call('/api/auth/mfa/verify', { method: 'POST', body: { mfaToken: 'not-a-mfa-ticket', code: totp(secret) } });
+  check('an invalid access credential cannot be used as a sign-in ticket', wrongPurpose.status === 401, wrongPurpose);
 
-  const verified = await call('/api/auth/mfa/verify', { method: 'POST', body: { mfaToken: challengedLogin.json.mfaToken, code: totp(secret) } });
-  check('a valid code completes sign-in with a session', verified.status === 200 && Boolean(verified.json.token) && Boolean(verified.json.refreshToken), verified.json);
+  const verified = await call('/api/auth/mfa/verify', { method: 'POST', client: challengedLogin.client, body: { mfaToken: challengedLogin.json.mfaToken, code: totp(secret) } });
+  check('a valid code completes sign-in with HttpOnly cookies', verified.status === 200 && verified.client.cookies.size === 2 && !verified.json.token && !verified.json.refreshToken, verified.json);
 
   const recoveryLogin = await login(adminEmail, newPassword);
-  const recoveryUse = await call('/api/auth/mfa/verify', { method: 'POST', body: { mfaToken: recoveryLogin.json.mfaToken, code: recoveryCodes[0] } });
+  const recoveryUse = await call('/api/auth/mfa/verify', { method: 'POST', client: recoveryLogin.client, body: { mfaToken: recoveryLogin.json.mfaToken, code: recoveryCodes[0] } });
   check('a recovery code completes sign-in', recoveryUse.status === 200 && recoveryUse.json.usedRecoveryCode === true, recoveryUse.json);
   check('one recovery code is burned per use', recoveryUse.json.recoveryCodesRemaining === 7, recoveryUse.json.recoveryCodesRemaining);
 
   const recoveryReplay = await login(adminEmail, newPassword);
-  const recoveryReuse = await call('/api/auth/mfa/verify', { method: 'POST', body: { mfaToken: recoveryReplay.json.mfaToken, code: recoveryCodes[0] } });
+  const recoveryReuse = await call('/api/auth/mfa/verify', { method: 'POST', client: recoveryReplay.client, body: { mfaToken: recoveryReplay.json.mfaToken, code: recoveryCodes[0] } });
   check('a used recovery code cannot be replayed', recoveryReuse.status === 401, recoveryReuse);
 
-  const wrongDisable = await call('/api/auth/mfa/disable', { method: 'POST', token: verified.json.token, body: { password: 'Nope-Not-The-Password1', code: totp(secret) } });
+  const wrongDisable = await call('/api/auth/mfa/disable', { method: 'POST', client: verified.client, body: { password: 'Nope-Not-The-Password1', code: totp(secret) } });
   check('disabling the second factor needs the correct password', wrongDisable.status === 403, wrongDisable);
 
-  const disable = await call('/api/auth/mfa/disable', { method: 'POST', token: verified.json.token, body: { password: newPassword, code: totp(secret) } });
+  const disable = await call('/api/auth/mfa/disable', { method: 'POST', client: verified.client, body: { password: newPassword, code: totp(secret) } });
   check('the correct password and a code switch it off', disable.status === 200, disable);
 
   const afterDisable = await login(adminEmail, newPassword);
-  check('login no longer challenges once it is off', afterDisable.status === 200 && !afterDisable.json.mfaRequired && Boolean(afterDisable.json.token), afterDisable.json);
+  check('login no longer challenges once it is off', afterDisable.status === 200 && !afterDisable.json.mfaRequired && afterDisable.client.cookies.size === 2, afterDisable.json);
 
   const cleared = await prisma.user.findUnique({ where: { id: admin.id }, select: { totpSecret: true, totpEnabledAt: true, recoveryCodes: true } });
   check('disabling clears the secret and the recovery codes', cleared.totpSecret === null && cleared.totpEnabledAt === null && cleared.recoveryCodes.length === 0, cleared);
@@ -252,22 +270,22 @@ async function main() {
   // --- Password change revokes sessions ---------------------------------------------------------
   const wrongCurrent = await call('/api/users/me/password', {
     method: 'POST',
-    token: tenantLogin.json.token,
+    client: tenantLogin.client,
     body: { currentPassword: 'Not-The-Password1', newPassword: 'Qa-Sec-Tenant-New!2026' },
   });
   check('changing a password needs the current password', wrongCurrent.status === 401, wrongCurrent);
 
   const changed = await call('/api/users/me/password', {
     method: 'POST',
-    token: tenantLogin.json.token,
+    client: tenantLogin.client,
     body: { currentPassword: tenantPassword, newPassword: 'Qa-Sec-Tenant-New!2026' },
   });
   check('a password change succeeds for a non-admin account', changed.status === 200, changed);
 
-  const meAfterChange = await call('/api/auth/me', { token: tenantLogin.json.token });
+  const meAfterChange = await call('/api/auth/me', { client: tenantLogin.client });
   check('a password change invalidates the access token', meAfterChange.status === 401, meAfterChange);
 
-  const refreshAfterChange = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: tenantLogin.json.refreshToken } });
+  const refreshAfterChange = await call('/api/auth/refresh', { method: 'POST', client: tenantLogin.client });
   check('a password change revokes the refresh token', refreshAfterChange.status === 401, refreshAfterChange);
 
   // --- Cleanup ---------------------------------------------------------------------------------

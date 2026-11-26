@@ -63,12 +63,13 @@ export function TenantInvite() {
     try {
       const response = await fetch(`/api/tenant-invitations/${encodeURIComponent(token)}/accept`, {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password }),
       });
       const data = await response.json();
       if (!response.ok || !data.success) throw new Error(data.error || 'Unable to accept this invitation.');
-      login(data.user, data.token);
+      login(data.user);
       navigate('/tenant', { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to accept this invitation.');

@@ -91,6 +91,7 @@ export function LoginRegister() {
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
@@ -110,7 +111,7 @@ export function LoginRegister() {
         return;
       }
 
-      login(data.user, data.token, data.refreshToken);
+      login(data.user);
       const redirectPath = data.user.role === 'tenant'
         ? '/tenant'
         : data.user.role === 'landlord'

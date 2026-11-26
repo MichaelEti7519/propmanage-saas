@@ -16,29 +16,22 @@ export interface AuthUser {
 
 interface AuthContextValue {
   user: AuthUser | null;
-  token: string | null;
   initializing: boolean;
-  login: (user: AuthUser, token: string, refreshToken?: string) => void;
+  login: (user: AuthUser) => void;
   logout: () => void;
   updateUser: (patch: Partial<AuthUser>) => void;
   fetchWithAuth: (input: RequestInfo, init?: RequestInit) => Promise<Response>;
 }
 
-const AUTH_TOKEN_KEY = 'propmanage_token';
-const AUTH_REFRESH_KEY = 'propmanage_refresh_token';
 const AUTH_USER_KEY = 'propmanage_user';
+const LEGACY_TOKEN_KEYS = ['propmanage_token', 'propmanage_refresh_token'];
 
 const AuthContext = React.createContext<AuthContextValue | undefined>(undefined);
-
-// A rotation invalidates the token it was handed, so two screens hitting 401 at the same moment must
-// share one refresh request. A second concurrent rotation would look like token theft to the server
-// and would sign the user out of everything.
-let refreshInFlight: Promise<string | null> | null = null;
+let refreshInFlight: Promise<boolean> | null = null;
 
 function clearStoredSession() {
   localStorage.removeItem(AUTH_USER_KEY);
-  localStorage.removeItem(AUTH_TOKEN_KEY);
-  localStorage.removeItem(AUTH_REFRESH_KEY);
+  LEGACY_TOKEN_KEYS.forEach((key) => localStorage.removeItem(key));
 }
 
 function getStoredUser(): AuthUser | null {
@@ -51,47 +44,25 @@ function getStoredUser(): AuthUser | null {
   }
 }
 
-function getStoredToken(): string | null {
-  return localStorage.getItem(AUTH_TOKEN_KEY);
-}
-
-function getStoredRefreshToken(): string | null {
-  return localStorage.getItem(AUTH_REFRESH_KEY);
-}
-
-// Exchanges the refresh token for a new pair. Returns null when the session is genuinely over.
-async function rotateSession(): Promise<string | null> {
+async function rotateSession() {
   if (refreshInFlight) return refreshInFlight;
-
-  const refreshToken = getStoredRefreshToken();
-  if (!refreshToken) return null;
-
   refreshInFlight = (async () => {
     try {
       const response = await fetch('/api/auth/refresh', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken }),
       });
       const data = await response.json().catch(() => null);
-
-      if (!response.ok || !data?.success || !data.token || !data.refreshToken) {
-        clearStoredSession();
-        return null;
-      }
-
-      localStorage.setItem(AUTH_TOKEN_KEY, data.token);
-      localStorage.setItem(AUTH_REFRESH_KEY, data.refreshToken);
+      if (!response.ok || !data?.success) return false;
       if (data.user) localStorage.setItem(AUTH_USER_KEY, JSON.stringify(data.user as AuthUser));
-      return data.token as string;
+      return true;
     } catch {
-      // A network failure is not proof the session is dead, so the tokens are left in place.
-      return null;
+      return false;
     }
   })().finally(() => {
     refreshInFlight = null;
   });
-
   return refreshInFlight;
 }
 
@@ -100,48 +71,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (typeof window === 'undefined') return null;
     return getStoredUser();
   });
-  const [token, setToken] = React.useState<string | null>(() => {
-    if (typeof window === 'undefined') return null;
-    return getStoredToken();
-  });
   const [initializing, setInitializing] = React.useState(true);
 
   const logout = React.useCallback(() => {
-    const refreshToken = getStoredRefreshToken();
-    const authToken = getStoredToken();
-
-    if (refreshToken || authToken) {
-      // Fire and forget: the local session is cleared either way, because a user who clicked
-      // "sign out" must end up signed out even if the network is down.
-      fetch('/api/auth/logout', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
-        body: JSON.stringify({ refreshToken }),
-      }).catch(() => undefined);
-    }
-
+    fetch('/api/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+    }).catch(() => undefined);
     clearStoredSession();
     setUser(null);
-    setToken(null);
   }, []);
 
-  const login = React.useCallback((newUser: AuthUser, newToken: string, newRefreshToken?: string) => {
+  const login = React.useCallback((newUser: AuthUser) => {
+    clearStoredSession();
     localStorage.setItem(AUTH_USER_KEY, JSON.stringify(newUser));
-    localStorage.setItem(AUTH_TOKEN_KEY, newToken);
-    if (newRefreshToken) {
-      localStorage.setItem(AUTH_REFRESH_KEY, newRefreshToken);
-    } else {
-      localStorage.removeItem(AUTH_REFRESH_KEY);
-    }
     setUser(newUser);
-    setToken(newToken);
   }, []);
 
-  // Merge edited profile fields into the session so avatars and names update everywhere
-  // without a re-login. The stored copy keeps the refresh path showing the latest values.
   const updateUser = React.useCallback((patch: Partial<AuthUser>) => {
     setUser((current) => {
       if (!current) return current;
@@ -151,91 +98,61 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const fetchWithAuth = React.useCallback(
-    async (input: RequestInfo, init: RequestInit = {}) => {
-      const send = (authToken: string | null) => {
-        const headers = new Headers(init.headers ?? undefined);
-        if (authToken) {
-          headers.set('Authorization', `Bearer ${authToken}`);
-        }
-        headers.set('Content-Type', headers.get('Content-Type') || 'application/json');
-        return fetch(input, { ...init, headers });
-      };
+  const fetchWithAuth = React.useCallback(async (input: RequestInfo, init: RequestInit = {}) => {
+    const send = () => {
+      const headers = new Headers(init.headers ?? undefined);
+      if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+      return fetch(input, { ...init, credentials: 'include', headers });
+    };
 
-      // localStorage is the source of truth: a rotation replaces the token outside React state.
-      const response = await send(getStoredToken() ?? token);
-      if (response.status !== 401) return response;
-
-      const refreshed = await rotateSession();
-      if (!refreshed) return response;
-
-      setToken(refreshed);
-      return send(refreshed);
-    },
-    [token]
-  );
+    const response = await send();
+    if (response.status !== 401) return response;
+    if (!(await rotateSession())) {
+      logout();
+      return response;
+    }
+    return send();
+  }, [logout]);
 
   React.useEffect(() => {
     let cancelled = false;
-
     async function validate() {
-      const storedToken = getStoredToken();
-      const storedUser = getStoredUser();
-
-      if (!storedToken || !storedUser) {
-        setInitializing(false);
-        return;
-      }
-
-      const fetchMe = (authToken: string) =>
-        fetch('/api/auth/me', {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${authToken}`,
-            'Content-Type': 'application/json',
-          },
-        });
-
       try {
-        let response = await fetchMe(storedToken);
-
-        // An expired access token is the normal case after a page reload, not a signed-out user.
-        if (response.status === 401 && getStoredRefreshToken()) {
-          const refreshed = await rotateSession();
-          if (refreshed) response = await fetchMe(refreshed);
+        let response = await fetch('/api/auth/me', { credentials: 'include' });
+        if (response.status === 401 && await rotateSession()) {
+          response = await fetch('/api/auth/me', { credentials: 'include' });
         }
-
         if (cancelled) return;
-
         if (!response.ok) {
-          logout();
+          clearStoredSession();
+          setUser(null);
           return;
         }
-
         const data = await response.json();
         if (data?.success && data?.user) {
-          const refreshedUser = data.user as AuthUser;
-          localStorage.setItem(AUTH_USER_KEY, JSON.stringify(refreshedUser));
-          setUser(refreshedUser);
-          setToken(getStoredToken());
+          const currentUser = data.user as AuthUser;
+          localStorage.setItem(AUTH_USER_KEY, JSON.stringify(currentUser));
+          LEGACY_TOKEN_KEYS.forEach((key) => localStorage.removeItem(key));
+          setUser(currentUser);
         } else {
-          logout();
+          clearStoredSession();
+          setUser(null);
         }
       } catch {
-        logout();
+        if (!cancelled) {
+          clearStoredSession();
+          setUser(null);
+        }
       } finally {
         if (!cancelled) setInitializing(false);
       }
     }
-
-    validate();
-    return () => {
-      cancelled = true;
-    };
-  }, [logout]);
+    void validate();
+    return () => { cancelled = true; };
+  }, []);
 
   return (
-    <AuthContext.Provider value={{ user, token, initializing, login, logout, updateUser, fetchWithAuth }}>
+    <AuthContext.Provider value={{ user, initializing, login, logout, updateUser, fetchWithAuth }}>
       {children}
     </AuthContext.Provider>
   );
@@ -243,8 +160,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
 export function useAuth() {
   const context = React.useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
+  if (!context) throw new Error('useAuth must be used within an AuthProvider');
   return context;
 }

@@ -93,17 +93,17 @@ function sanitizeString(value: unknown) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-async function readDatabaseOrFallback<T>(fallback: T, operation: () => Promise<T>): Promise<T> {
+async function readDatabaseOrFallback<T>(_unavailable: undefined, operation: () => Promise<T>): Promise<T | undefined> {
   if (!process.env.DATABASE_URL) {
-    console.warn('DATABASE_URL is not configured; serving fallback data.');
-    return fallback;
+    console.warn('DATABASE_URL is not configured; database-backed route is unavailable.');
+    return undefined;
   }
 
   try {
     return await operation();
   } catch (error) {
-    console.warn('Database operation failed; serving fallback data:', error instanceof Error ? error.message : error);
-    return fallback;
+    console.warn('Database operation failed; database-backed route is unavailable:', error instanceof Error ? error.message : error);
+    return undefined;
   }
 }
 
@@ -204,7 +204,7 @@ class PostgresRateLimitStore implements Store {
 
   constructor(private readonly namespace: string) {}
 
-  init(options: { windowMs: number }) {
+  init(options: Parameters<NonNullable<Store['init']>>[0]) {
     this.windowMs = options.windowMs;
     if (!this.cleanupTimer) {
       this.cleanupTimer = setInterval(() => {
@@ -293,7 +293,7 @@ function serializeAccount(user: User) {
 }
 function createAuthToken(user: User) {
   const jti = randomUUID();
-  return jwt.sign(
+  const token = jwt.sign(
     {
       sub: user.id,
       email: user.email,
@@ -304,6 +304,7 @@ function createAuthToken(user: User) {
     JWT_SECRET,
     { expiresIn: JWT_EXPIRY, jwtid: jti }
   );
+  return { token, jti };
 }
 
 // ---- Sessions, password reset, and second factor ----------------------------------------------
@@ -329,10 +330,27 @@ function appBaseUrl() {
   return (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
 }
 
+async function persistEmailDeliveryEvent(providerEventId: string, emailId: string | null, eventType: string, occurredAt: Date) {
+  await prisma.emailDeliveryEvent.upsert({
+    where: { providerEventId },
+    create: { providerEventId, emailId, eventType, occurredAt },
+    update: {},
+  });
+}
+
+async function recordEmailSendFailure() {
+  try {
+    await persistEmailDeliveryEvent(`send-failed:${randomUUID()}`, null, 'email.failed', new Date());
+  } catch (error) {
+    console.error('Unable to persist failed email event:', error instanceof Error ? error.message : 'database error');
+  }
+}
+
 async function sendAccountEmail(to: string, subject: string, text: string, html?: string) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {
     emailDeliveryState = 'degraded';
+    await recordEmailSendFailure();
     return false;
   }
   try {
@@ -350,16 +368,28 @@ async function sendAccountEmail(to: string, subject: string, text: string, html?
     const result = await response.json().catch(() => ({}));
     if (!response.ok) {
       emailDeliveryState = 'degraded';
+      await recordEmailSendFailure();
       console.error('Account email provider rejected a message:', JSON.stringify({ status: response.status, subject, providerCode: result?.name ?? 'unknown error' }));
       return false;
     }
-    emailDeliveryState = 'healthy';
+    const emailId = typeof result?.id === 'string' ? result.id : null;
+    let eventStored = false;
+    if (emailId) {
+      try {
+        await persistEmailDeliveryEvent(`send:${emailId}`, emailId, 'email.sent', new Date());
+        eventStored = true;
+      } catch (error) {
+        console.error('Unable to persist accepted email event:', error instanceof Error ? error.message : 'database error');
+      }
+    }
+    emailDeliveryState = eventStored ? 'healthy' : 'degraded';
     emailLastEventAt = new Date().toISOString();
     emailLastEventType = 'email.sent';
     console.info('Account email accepted by provider:', JSON.stringify({ subject, providerId: result?.id ?? null }));
     return true;
   } catch (error) {
     emailDeliveryState = 'degraded';
+    await recordEmailSendFailure();
     console.error('Account email delivery request failed:', error instanceof Error ? error.message : 'network error');
     return false;
   }
@@ -396,20 +426,59 @@ async function deliverAccountLink(email: string, label: string, link: string, su
 
 async function issueSession(user: User, userAgent?: string | null) {
   const refreshToken = newOpaqueToken(48);
+  const access = createAuthToken(user);
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
   await prisma.refreshToken.create({
     data: {
       userId: user.id,
       tokenHash: hashToken(refreshToken),
+      accessJti: access.jti,
       expiresAt,
       userAgent: userAgent ? userAgent.slice(0, 200) : null,
     },
   });
   return {
-    token: createAuthToken(user),
+    token: access.token,
+    accessJti: access.jti,
     refreshToken,
     refreshTokenExpiresAt: expiresAt.toISOString(),
   };
+}
+
+function authCookieNames() {
+  const prefix = process.env.NODE_ENV === 'production' ? '__Host-' : '';
+  return { access: `${prefix}propmanage_access`, refresh: `${prefix}propmanage_refresh` };
+}
+
+function readCookie(req: express.Request, name: string) {
+  const cookies = req.headers.cookie?.split(';') ?? [];
+  for (const entry of cookies) {
+    const separator = entry.indexOf('=');
+    if (separator < 0 || entry.slice(0, separator).trim() !== name) continue;
+    const value = entry.slice(separator + 1).trim();
+    try { return decodeURIComponent(value); } catch { return value; }
+  }
+  return '';
+}
+
+function appendSetCookie(res: express.Response, cookie: string) {
+  const previous = res.getHeader('Set-Cookie');
+  const existing = Array.isArray(previous) ? previous.map(String) : previous ? [String(previous)] : [];
+  res.setHeader('Set-Cookie', [...existing, cookie]);
+}
+
+function setAuthCookies(res: express.Response, session: { token: string; refreshToken: string }) {
+  const names = authCookieNames();
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  appendSetCookie(res, `${names.access}=${encodeURIComponent(session.token)}; Max-Age=7200; Path=/; HttpOnly; SameSite=Lax${secure}`);
+  appendSetCookie(res, `${names.refresh}=${encodeURIComponent(session.refreshToken)}; Max-Age=${REFRESH_TOKEN_TTL_DAYS * 86400}; Path=/; HttpOnly; SameSite=Lax${secure}`);
+}
+
+function clearAuthCookies(res: express.Response) {
+  const names = authCookieNames();
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  appendSetCookie(res, `${names.access}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secure}`);
+  appendSetCookie(res, `${names.refresh}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secure}`);
 }
 
 async function revokeAllSessions(userId: string, reason: string) {
@@ -502,20 +571,26 @@ async function consumeRecoveryCode(userId: string, code: string) {
 
 async function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
   const authHeader = req.header('authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ success: false, error: 'Authorization token is required.' });
-  }
-
-  const token = authHeader.replace('Bearer ', '').trim();
+  const token = readCookie(req, authCookieNames().access)
+    || (authHeader?.startsWith('Bearer ') ? authHeader.replace('Bearer ', '').trim() : '');
+  if (!token) return res.status(401).json({ success: false, error: 'Authorization session is required.' });
   try {
     const payload = jwt.verify(token, JWT_SECRET) as any;
-    // reject if token jti is blacklisted
-    if (payload?.jti && tokenBlacklist.has(payload.jti)) {
-      return res.status(401).json({ success: false, error: 'Token has been revoked.' });
+    if (!payload?.sub || !payload?.jti) return res.status(401).json({ success: false, error: 'Invalid access token.' });
+    const session = await prisma.refreshToken.findUnique({
+      where: { accessJti: payload.jti },
+      select: {
+        userId: true,
+        revokedAt: true,
+        expiresAt: true,
+        user: { select: { role: true, totpEnabledAt: true } },
+      },
+    });
+    if (!session || session.userId !== payload.sub || session.revokedAt || session.expiresAt.getTime() <= Date.now()) {
+      return res.status(401).json({ success: false, error: 'Session has expired or been revoked.' });
     }
-    // reject if token issued before a user-wide revocation time
-    if (payload?.sub && payload?.iat && revokedBefore[payload.sub] && payload.iat * 1000 < revokedBefore[payload.sub]) {
-      return res.status(401).json({ success: false, error: 'Token has been revoked (user logout).' });
+    if (session.user.role !== payload.role) {
+      return res.status(401).json({ success: false, error: 'Account permissions changed. Sign in again.' });
     }
     const authReq = req as AuthRequest;
     authReq.user = {
@@ -531,14 +606,7 @@ async function authMiddleware(req: express.Request, res: express.Response, next:
 
     // Admins without MFA can only reach the enrollment and basic account endpoints. This lets
     // bootstrap admins enroll their authenticator while every privileged API stays locked.
-    if (payload.role === 'admin') {
-      const account = await prisma.user.findUnique({
-        where: { id: payload.sub },
-        select: { role: true, totpEnabledAt: true },
-      });
-      if (!account || account.role !== 'admin') {
-        return res.status(401).json({ success: false, error: 'Administrator account is unavailable.' });
-      }
+    if (session.user.role === 'admin') {
       const mfaEnrollmentPaths = new Set([
         '/api/auth/me',
         '/api/auth/sessions',
@@ -549,7 +617,7 @@ async function authMiddleware(req: express.Request, res: express.Response, next:
         '/api/auth/mfa/enable',
         '/api/auth/mfa/disable',
       ]);
-      if (!account.totpEnabledAt && !mfaEnrollmentPaths.has(req.path)) {
+      if (!session.user.totpEnabledAt && !mfaEnrollmentPaths.has(req.path)) {
         return res.status(403).json({
           success: false,
           code: 'ADMIN_MFA_REQUIRED',
@@ -575,10 +643,6 @@ function requireRole(...allowedRoles: User['role'][]) {
     }
     next();
   };
-}
-
-function canAccessProperty(user: AuthRequest['user'], property: Property) {
-  return user?.role === 'admin' || (user?.role === 'landlord' && property.landlordId === user.sub);
 }
 
 interface Property {
@@ -623,25 +687,6 @@ interface Tenant {
   rent: number;
 }
 
-function canAccessTenant(user: AuthRequest['user'], tenant: Tenant) {
-  if (user?.role === 'admin') return true;
-  if (user?.role === 'tenant') return tenant.userId === user.sub;
-  const unit = units.find((item) => item.id === tenant.unitId);
-  const property = unit && properties.find((item) => item.id === unit.propertyId);
-  return user?.role === 'landlord' && (tenant.landlordId === user.sub || property?.landlordId === user.sub);
-}
-
-interface Payment {
-  id: string;
-  tenantId: string;
-  unitId: string;
-  amount: number;
-  dueDate: string;
-  paidDate?: string;
-  status: 'paid' | 'pending' | 'overdue';
-  method: string;
-}
-
 interface MaintenanceRequest {
   id: string;
   propertyId: string;
@@ -653,63 +698,6 @@ interface MaintenanceRequest {
   priority: 'Low' | 'Medium' | 'High';
   createdAt: string;
   updatedAt: string;
-}
-
-const now = new Date();
-const today = now.toISOString().split('T')[0];
-
-const properties: Property[] = [
-  {
-    id: 'p1',
-    landlordId: 'u-landlord',
-    name: 'Sunset Villas',
-    address: '123 Harbor Dr',
-    city: 'Springfield',
-    state: 'IL',
-    units: 24,
-    occupancy: 22,
-    status: 'Active',
-    manager: 'Acme Property Management',
-  },
-  {
-    id: 'p2',
-    landlordId: 'u-landlord',
-    name: 'The Grand Apartments',
-    address: '450 Main St',
-    city: 'Springfield',
-    state: 'IL',
-    units: 16,
-    occupancy: 16,
-    status: 'Active',
-    manager: 'Acme Property Management',
-  },
-];
-
-const units: Unit[] = [
-  { id: 'u1', propertyId: 'p1', number: '1A', floor: 1, bedrooms: 2, bathrooms: 1, rent: 1800, status: 'occupied', tenantId: 't3' },
-  { id: 'u2', propertyId: 'p1', number: '2B', floor: 2, bedrooms: 1, bathrooms: 1, rent: 1500, status: 'vacant' },
-  { id: 'u3', propertyId: 'p2', number: '4B', floor: 4, bedrooms: 2, bathrooms: 2, rent: 2400, status: 'occupied', tenantId: 't1' },
-];
-
-const tenants: Tenant[] = [
-  { id: 't1', firstName: 'John', lastName: 'Doe', email: 'john.doe@example.com', phone: '(555) 123-4567', unitId: 'u3', status: 'Active', leaseStart: '2025-01-01', leaseEnd: '2026-12-31', rent: 2400 },
-  { id: 't2', firstName: 'Sarah', lastName: 'Smith', email: 'sarah.s@example.com', phone: '(555) 987-6543', status: 'Applicant', rent: 0 },
-  { id: 't3', firstName: 'Michael', lastName: 'Johnson', email: 'mjohnson@example.com', phone: '(555) 555-5555', unitId: 'u1', status: 'Active', leaseStart: '2024-07-01', leaseEnd: '2025-06-30', rent: 1800 },
-];
-
-
-const payments: Payment[] = [
-  { id: 'pay1', tenantId: 't1', unitId: 'u3', amount: 2400, dueDate: '2026-06-01', paidDate: '2026-06-01', status: 'paid', method: 'Credit Card' },
-  { id: 'pay2', tenantId: 't3', unitId: 'u1', amount: 1800, dueDate: '2026-06-15', status: 'pending', method: 'Bank Transfer' },
-];
-
-const maintenanceRequests: MaintenanceRequest[] = [
-  { id: 'm1', propertyId: 'p1', unitId: 'u1', tenantId: 't3', title: 'HVAC not cooling', description: 'The air conditioning is blowing warm air all day.', status: 'open', priority: 'High', createdAt: '2026-06-10', updatedAt: '2026-06-10' },
-  { id: 'm2', propertyId: 'p2', unitId: 'u3', tenantId: 't1', title: 'Leaky kitchen faucet', description: 'Faucet drips continuously after being turned off.', status: 'in_progress', priority: 'Medium', createdAt: '2026-06-05', updatedAt: '2026-06-12' },
-];
-
-function createId(prefix = 'id') {
-  return `${prefix}_${Math.random().toString(36).slice(2, 9)}_${Date.now()}`;
 }
 
 async function startServer() {
@@ -759,6 +747,17 @@ async function startServer() {
     credentials: true,
   }));
 
+  app.use((req, res, next) => {
+    const isUnsafeMethod = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+    if (!isUnsafeMethod || req.path === '/api/webhooks/resend') return next();
+    const origin = req.get('origin');
+    const hasSessionCookie = Boolean(readCookie(req, authCookieNames().access) || readCookie(req, authCookieNames().refresh));
+    if ((origin && !allowedOrigins.includes(origin)) || (hasSessionCookie && !origin)) {
+      return res.status(403).json({ success: false, error: 'Request origin is not allowed.' });
+    }
+    next();
+  });
+
   // Keep the provider webhook's exact bytes available for signature verification.
   app.use('/api/webhooks/resend', express.raw({ type: 'application/json', limit: '256kb' }));
   app.use(express.json({ limit: '10mb' }));
@@ -773,6 +772,7 @@ async function startServer() {
   }));
 
   const apiLimiter = rateLimit({
+    store: new PostgresRateLimitStore(`propmanage:${process.env.RATE_LIMIT_NAMESPACE || 'default'}:api`),
     windowMs: 60 * 1000,
     max: 100,
     standardHeaders: true,
@@ -784,6 +784,7 @@ async function startServer() {
   // instance does not exhaust it, and so the limit can be tuned without a code change.
   const authLimitMax = Number(process.env.AUTH_RATE_LIMIT_MAX ?? 5);
   const authLimiter = rateLimit({
+    store: new PostgresRateLimitStore(`propmanage:${process.env.RATE_LIMIT_NAMESPACE || 'default'}:auth`),
     windowMs: 15 * 60 * 1000,
     max: Number.isFinite(authLimitMax) && authLimitMax > 0 ? authLimitMax : 5,
     standardHeaders: true,
@@ -793,6 +794,7 @@ async function startServer() {
   });
 
   const registerLimiter = rateLimit({
+    store: new PostgresRateLimitStore(`propmanage:${process.env.RATE_LIMIT_NAMESPACE || 'default'}:register`),
     windowMs: 60 * 60 * 1000,
     max: 5,
     standardHeaders: true,
@@ -801,6 +803,7 @@ async function startServer() {
   });
 
   const inviteCreateLimiter = rateLimit({
+    store: new PostgresRateLimitStore(`propmanage:${process.env.RATE_LIMIT_NAMESPACE || 'default'}:invite-create`),
     windowMs: 60 * 60 * 1000,
     max: 20,
     standardHeaders: true,
@@ -809,6 +812,7 @@ async function startServer() {
   });
 
   const inviteAcceptLimiter = rateLimit({
+    store: new PostgresRateLimitStore(`propmanage:${process.env.RATE_LIMIT_NAMESPACE || 'default'}:invite-accept`),
     windowMs: 15 * 60 * 1000,
     max: 10,
     standardHeaders: true,
@@ -828,21 +832,32 @@ async function startServer() {
     next();
   });
 
-  app.get('/api/health', (_req, res) => {
+  app.get('/api/health', async (_req, res) => {
     const emailConfigured = Boolean(
       process.env.RESEND_API_KEY
       && (process.env.EMAIL_FROM || process.env.NODE_ENV !== 'production')
       && process.env.RESEND_WEBHOOK_SECRET
     );
-    res.json({
-      status: emailDeliveryState === 'degraded' ? 'degraded' : 'ok',
-      uptime: process.uptime(),
-      timestamp: new Date().toISOString(),
-      email: { configured: emailConfigured, delivery: emailDeliveryState, lastEvent: emailLastEventType, lastEventAt: emailLastEventAt },
-    });
+    try {
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const [latest, failures24h] = await Promise.all([
+        prisma.emailDeliveryEvent.findFirst({ orderBy: [{ occurredAt: 'desc' }, { receivedAt: 'desc' }] }),
+        prisma.emailDeliveryEvent.count({ where: { occurredAt: { gte: since }, eventType: { in: ['email.delivery_delayed', 'email.bounced', 'email.failed', 'email.suppressed', 'email.complained'] } } }),
+      ]);
+      const delivery = failures24h > 0 || emailDeliveryState === 'degraded' ? 'degraded' : (latest ? 'healthy' : emailDeliveryState);
+      return res.json({
+        status: delivery === 'degraded' ? 'degraded' : 'ok',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        email: { configured: emailConfigured, delivery, lastEvent: latest?.eventType ?? emailLastEventType, lastEventAt: latest?.occurredAt.toISOString() ?? emailLastEventAt, failures24h },
+      });
+    } catch (error) {
+      console.error('Unable to load durable email delivery health:', error instanceof Error ? error.message : 'database error');
+      return res.status(503).json({ status: 'degraded', uptime: process.uptime(), timestamp: new Date().toISOString(), email: { configured: emailConfigured, delivery: 'unknown', error: 'Delivery history is unavailable.' } });
+    }
   });
 
-  app.post('/api/webhooks/resend', (req, res) => {
+  app.post('/api/webhooks/resend', async (req, res) => {
     if (!isValidResendWebhook(req)) {
       return res.status(401).json({ success: false, error: 'Invalid email provider signature.' });
     }
@@ -856,6 +871,18 @@ async function startServer() {
     const trackedTypes = new Set(['email.sent', 'email.delivered', 'email.delivery_delayed', 'email.bounced', 'email.failed', 'email.suppressed', 'email.complained']);
     if (!trackedTypes.has(eventType)) return res.json({ success: true, ignored: true });
 
+    const providerEventId = req.header('svix-id')!;
+    const occurredAt = new Date(event?.created_at ?? Date.now());
+    if (!Number.isFinite(occurredAt.getTime())) {
+      return res.status(400).json({ success: false, error: 'Invalid email event timestamp.' });
+    }
+    try {
+      await persistEmailDeliveryEvent(providerEventId, typeof event?.data?.email_id === 'string' ? event.data.email_id : null, eventType, occurredAt);
+    } catch (error) {
+      console.error('Unable to persist Resend delivery event:', error instanceof Error ? error.message : 'database error');
+      return res.status(503).json({ success: false, error: 'Delivery event could not be stored. Please retry.' });
+    }
+
     emailLastEventAt = new Date().toISOString();
     emailLastEventType = eventType;
     emailDeliveryState = ['email.delivery_delayed', 'email.bounced', 'email.failed', 'email.suppressed', 'email.complained'].includes(eventType)
@@ -863,6 +890,16 @@ async function startServer() {
       : 'healthy';
     console.info('Resend delivery event:', JSON.stringify({ type: eventType, emailId: event?.data?.email_id ?? null }));
     return res.json({ success: true });
+  });
+
+  app.get('/api/admin/email-delivery', requireRole('admin'), async (_req, res) => {
+    try {
+      const events = await prisma.emailDeliveryEvent.findMany({ orderBy: [{ occurredAt: 'desc' }, { receivedAt: 'desc' }], take: 100 });
+      return res.json({ success: true, data: events.map(({ providerEventId, emailId, eventType, occurredAt, receivedAt }) => ({ providerEventId, emailId, eventType, occurredAt: occurredAt.toISOString(), receivedAt: receivedAt.toISOString() })) });
+    } catch (error) {
+      console.error('Unable to load email delivery history:', error instanceof Error ? error.message : 'database error');
+      return res.status(503).json({ success: false, error: 'Email delivery history is temporarily unavailable.' });
+    }
   });
 
   app.post('/api/contact', async (req, res) => {
@@ -1175,6 +1212,7 @@ async function startServer() {
       });
       const newUser: User = { ...dbUser, phone: dbUser.phone ?? undefined };
       const session = await issueSession(newUser, req.get('user-agent'));
+      setAuthCookies(res, session);
       return res.status(201).json({
         success: true,
         user: {
@@ -1193,7 +1231,7 @@ async function startServer() {
           incomeVerificationStatus: newUser.incomeVerificationStatus,
           payoutVerificationStatus: newUser.payoutVerificationStatus,
         },
-        ...session,
+        refreshTokenExpiresAt: session.refreshTokenExpiresAt,
       });
     } catch (error) {
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') {
@@ -1244,10 +1282,11 @@ async function startServer() {
 
     try {
       const session = await issueSession(user, req.get('user-agent'));
+      setAuthCookies(res, session);
       return res.json({
         success: true,
         user: serializeAccount(user),
-        ...session,
+        refreshTokenExpiresAt: session.refreshTokenExpiresAt,
         mfaEnrollmentRequired: user.role === 'admin',
       });
     } catch (error) {
@@ -1257,35 +1296,40 @@ async function startServer() {
   });
 
   // Signing out is deliberately public: an expired access token must still be able to revoke its
-  // refresh token, otherwise a dead tab leaves a live session behind.
+  // refresh token, including when the short-lived access cookie has expired.
   app.post('/api/auth/logout', async (req, res) => {
     const authHeader = req.header('authorization');
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      try {
-        const payload = jwt.verify(authHeader.replace('Bearer ', '').trim(), JWT_SECRET) as any;
-        if (payload?.jti) tokenBlacklist.add(payload.jti);
-      } catch {
-        // Expired or malformed token: nothing to blacklist, the refresh token still gets revoked.
+    const accessToken = readCookie(req, authCookieNames().access)
+      || (authHeader?.startsWith('Bearer ') ? authHeader.replace('Bearer ', '').trim() : '');
+    const refreshToken = readCookie(req, authCookieNames().refresh);
+    try {
+      if (accessToken) {
+        try {
+          const payload = jwt.verify(accessToken, JWT_SECRET, { ignoreExpiration: true }) as any;
+          if (payload?.jti) {
+            await prisma.refreshToken.updateMany({
+              where: { accessJti: payload.jti, revokedAt: null },
+              data: { revokedAt: new Date(), revokedReason: 'logout' },
+            });
+          }
+        } catch {
+          // Invalid or tampered access tokens cannot be used to select a session to revoke.
+        }
       }
-    }
-
-    const refreshToken = sanitizeString(req.body?.refreshToken);
-    if (refreshToken) {
-      try {
+      if (refreshToken) {
         await prisma.refreshToken.updateMany({
           where: { tokenHash: hashToken(refreshToken), revokedAt: null },
           data: { revokedAt: new Date(), revokedReason: 'logout' },
         });
-      } catch (error) {
-        console.error('Unable to revoke session on logout:', error);
-        return res.status(503).json({ success: false, error: 'Sign-out could not be completed. Close the tab and try again.' });
       }
+    } catch (error) {
+      console.error('Unable to revoke session on logout:', error);
+      return res.status(503).json({ success: false, error: 'Sign-out could not be completed. Close the tab and try again.' });
     }
-
+    clearAuthCookies(res);
     return res.json({ success: true, message: 'Logged out successfully.' });
   });
 
-  // Invalidate every session for the current user, in memory and in the database.
   app.post('/api/auth/logout-all', async (req, res) => {
     const authReq = req as AuthRequest;
     if (!authReq.user) return res.status(401).json({ success: false, error: 'Not authenticated.' });
@@ -1295,7 +1339,7 @@ async function startServer() {
       console.error('Unable to revoke all sessions:', error);
       return res.status(503).json({ success: false, error: 'Sessions could not be revoked right now.' });
     }
-    revokedBefore[authReq.user.sub] = Date.now();
+    clearAuthCookies(res);
     return res.json({ success: true, message: 'All sessions for this user have been invalidated.' });
   });
 
@@ -1317,9 +1361,9 @@ async function startServer() {
         where: { id: adminUser.id },
         data: { passwordHash: await bcrypt.hash(newPassword, BCRYPT_ROUNDS) },
       });
-      revokedBefore[adminUser.id] = Date.now();
       await revokeAllSessions(adminUser.id, 'password_rotated');
-      return res.json({ success: true, message: 'Password updated. Sign in again with the new password.' });
+      clearAuthCookies(res);
+      return res.json({ success: true, message: 'Password updated. Sign in again.' });
     } catch (error) {
       console.error('Unable to rotate admin password:', error);
       return res.status(503).json({ success: false, error: 'Password service is temporarily unavailable.' });
@@ -1332,29 +1376,23 @@ async function startServer() {
       return res.status(401).json({ success: false, error: 'Not authenticated.' });
     }
 
-    // Read through to the database so renames and avatars survive a page reload. The JWT
-    // only carries the identity, so the raw claims are the fallback, not the source of truth.
+    // Read through to the database so current account state remains authoritative.
     try {
       const dbUser = await prisma.user.findUnique({ where: { id: authReq.user.sub } });
-      if (dbUser) {
-        return res.json({ success: true, user: serializeAccount({ ...dbUser, phone: dbUser.phone ?? undefined }) });
-      }
+      if (!dbUser) return res.status(401).json({ success: false, error: 'Account is unavailable.' });
+      return res.json({ success: true, user: serializeAccount({ ...dbUser, phone: dbUser.phone ?? undefined }) });
     } catch (error) {
       console.error('Unable to load account for session refresh:', error);
+      return res.status(503).json({ success: false, error: 'Account details are temporarily unavailable.' });
     }
-
-    const { sub, email, role, firstName, lastName } = authReq.user;
-    return res.json({
-      success: true,
-      user: { id: sub, email, role, firstName, lastName, phone: null, avatarUrl: null },
-    });
   });
 
   // Exchanging a refresh token rotates it: the presented token dies, a new one takes its place.
   // Presenting an already-rotated token is treated as theft and drops every session for that user.
   app.post('/api/auth/refresh', async (req, res) => {
-    const refreshToken = sanitizeString(req.body?.refreshToken);
+    const refreshToken = readCookie(req, authCookieNames().refresh);
     if (!refreshToken) {
+      clearAuthCookies(res);
       return res.status(400).json({ success: false, error: 'A refresh token is required.' });
     }
 
@@ -1364,39 +1402,51 @@ async function startServer() {
         include: { user: true },
       });
       if (!record) {
+        clearAuthCookies(res);
         return res.status(401).json({ success: false, error: 'Session expired. Sign in again.' });
       }
       if (record.revokedAt) {
         await revokeAllSessions(record.userId, 'token_reuse');
+        clearAuthCookies(res);
         return res.status(401).json({ success: false, error: 'Session expired. Sign in again.' });
       }
       if (record.expiresAt.getTime() <= Date.now()) {
+        clearAuthCookies(res);
         return res.status(401).json({ success: false, error: 'Session expired. Sign in again.' });
       }
 
       const nextToken = newOpaqueToken(48);
+      const refreshed: User = { ...record.user, phone: record.user.phone ?? undefined };
+      const access = createAuthToken(refreshed);
       const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
-      await prisma.$transaction([
-        prisma.refreshToken.update({
-          where: { id: record.id },
+      const rotated = await prisma.$transaction(async (transaction) => {
+        const claimed = await transaction.refreshToken.updateMany({
+          where: { id: record.id, revokedAt: null, expiresAt: { gt: new Date() } },
           data: { revokedAt: new Date(), revokedReason: 'rotated' },
-        }),
-        prisma.refreshToken.create({
+        });
+        if (claimed.count !== 1) return false;
+        await transaction.refreshToken.create({
           data: {
             userId: record.userId,
             tokenHash: hashToken(nextToken),
+            accessJti: access.jti,
             expiresAt,
             userAgent: record.userAgent,
           },
-        }),
-      ]);
+        });
+        return true;
+      });
+      if (!rotated) {
+        await revokeAllSessions(record.userId, 'token_reuse');
+        clearAuthCookies(res);
+        return res.status(401).json({ success: false, error: 'Session expired. Sign in again.' });
+      }
 
-      const refreshed: User = { ...record.user, phone: record.user.phone ?? undefined };
+      const refreshedSession = { token: access.token, refreshToken: nextToken };
+      setAuthCookies(res, refreshedSession);
       return res.json({
         success: true,
         user: serializeAccount(refreshed),
-        token: createAuthToken(refreshed),
-        refreshToken: nextToken,
         refreshTokenExpiresAt: expiresAt.toISOString(),
       });
     } catch (error) {
@@ -1497,7 +1547,7 @@ async function startServer() {
         }),
       ]);
 
-      revokedBefore[record.userId] = Date.now();
+      clearAuthCookies(res);
       return res.json({ success: true, message: 'Password updated. Sign in with the new password.' });
     } catch (error) {
       console.error('Unable to complete password reset:', error);
@@ -1757,6 +1807,7 @@ async function startServer() {
 
       const account: User = { ...user, phone: user.phone ?? undefined };
       const session = await issueSession(account, req.get('user-agent'));
+      setAuthCookies(res, session);
       // A recovery code is deleted as it is used, so the count is re-read rather than taken from the
       // snapshot loaded before verification.
       const recoveryCodesRemaining = recoveryValid
@@ -1765,7 +1816,7 @@ async function startServer() {
       return res.json({
         success: true,
         user: serializeAccount(account),
-        ...session,
+        refreshTokenExpiresAt: session.refreshTokenExpiresAt,
         usedRecoveryCode: recoveryValid,
         recoveryCodesRemaining,
       });
@@ -1846,7 +1897,7 @@ async function startServer() {
       // A password change ends every session: if the old password had leaked, the session it bought
       // must not outlive the change.
       await revokeAllSessions(authReq.user.sub, 'password_changed');
-      revokedBefore[authReq.user.sub] = Date.now();
+      clearAuthCookies(res);
       return res.json({ success: true, message: 'Password updated. Sign in again with the new password.' });
     } catch (error) {
       console.error('Unable to change password:', error);
@@ -2133,14 +2184,6 @@ async function startServer() {
             email: newUser.email,
             role: newUser.role,
           },
-          token: createAuthToken({
-            id: newUser.id,
-            firstName: newUser.firstName,
-            lastName: newUser.lastName,
-            email: newUser.email,
-            role: newUser.role,
-            passwordHash: newUser.passwordHash,
-          }),
         },
       };
     });
@@ -2149,7 +2192,20 @@ async function startServer() {
       return res.status(dbResult.status).json({ success: false, error: dbResult.message });
     }
     if (dbResult && dbResult.type === 'success') {
-      return res.status(dbResult.status).json({ success: true, ...dbResult.data });
+      try {
+        const account = await prisma.user.findUnique({ where: { id: dbResult.data.user.id } });
+        if (!account) return res.status(503).json({ success: false, error: 'Invitation was accepted; sign in to continue.' });
+        const session = await issueSession({ ...account, phone: account.phone ?? undefined }, req.get('user-agent'));
+        setAuthCookies(res, session);
+        return res.status(dbResult.status).json({
+          success: true,
+          user: serializeAccount({ ...account, phone: account.phone ?? undefined }),
+          refreshTokenExpiresAt: session.refreshTokenExpiresAt,
+        });
+      } catch (error) {
+        console.error('Unable to create invited tenant session:', error);
+        return res.status(503).json({ success: false, error: 'Invitation was accepted; sign in to continue.' });
+      }
     }
     return res.status(503).json({ success: false, error: 'Invitation service is temporarily unavailable.' });
   });
@@ -2710,10 +2766,7 @@ async function startServer() {
       return res.json({ success: true, data: dbProperties });
     }
 
-    const visibleProperties = user?.role === 'admin'
-      ? properties
-      : properties.filter((property) => property.landlordId === user?.sub);
-    res.json({ success: true, data: visibleProperties });
+    return res.status(503).json({ success: false, error: 'Properties are temporarily unavailable. Please try again shortly.' });
   });
 
   app.get('/api/properties/:id', async (req, res) => {
@@ -2735,11 +2788,7 @@ async function startServer() {
       return res.json({ success: true, data: dbProperty });
     }
 
-    const property = properties.find((item) => item.id === req.params.id);
-    if (!property || !canAccessProperty((req as AuthRequest).user, property)) {
-      return res.status(404).json({ success: false, error: 'Property not found.' });
-    }
-    res.json({ success: true, data: property });
+    return res.status(503).json({ success: false, error: 'Properties are temporarily unavailable. Please try again shortly.' });
   });
 
   app.post('/api/properties', requireRole('landlord', 'admin'), async (req, res) => {
@@ -2770,20 +2819,7 @@ async function startServer() {
       return res.status(201).json({ success: true, data: dbProperty });
     }
 
-    const property: Property = {
-      id: createId('prop'),
-      landlordId: user!.sub,
-      name,
-      address,
-      city,
-      state,
-      units: unitCount ?? 0,
-      occupancy: 0,
-      status: 'Active',
-      manager: manager || 'Acme Property Management',
-    };
-    properties.push(property);
-    res.status(201).json({ success: true, data: property });
+    return res.status(503).json({ success: false, error: 'Properties are temporarily unavailable. Please try again shortly.' });
   });
 
   app.put('/api/properties/:id', requireRole('landlord', 'admin'), async (req, res) => {
@@ -3041,18 +3077,7 @@ async function startServer() {
       return res.json({ success: true, data: dbUnits });
     }
 
-    let results = user?.role === 'admin'
-      ? [...units]
-      : user?.role === 'tenant'
-        ? units.filter((unit) => tenants.some((tenant) => tenant.userId === user.sub && tenant.unitId === unit.id))
-        : units.filter((unit) => properties.some((property) => property.id === unit.propertyId && property.landlordId === user?.sub));
-    if (propertyId) {
-      results = results.filter((unit) => unit.propertyId === propertyId);
-    }
-    if (status) {
-      results = results.filter((unit) => unit.status === status);
-    }
-    res.json({ success: true, data: results });
+    return res.status(503).json({ success: false, error: 'Units are temporarily unavailable. Please try again shortly.' });
   });
 
   app.post('/api/units', requireRole('landlord', 'admin'), async (req, res) => {
@@ -3230,15 +3255,7 @@ async function startServer() {
       return res.json({ success: true, data: dbTenants });
     }
 
-    let results = user?.role === 'admin'
-      ? [...tenants]
-      : user?.role === 'tenant'
-        ? tenants.filter((tenant) => tenant.userId === user.sub)
-        : tenants.filter((tenant) => canAccessTenant(user, tenant));
-    if (status) {
-      results = results.filter((tenant) => tenant.status === status);
-    }
-    res.json({ success: true, data: results });
+    return res.status(503).json({ success: false, error: 'Tenants are temporarily unavailable. Please try again shortly.' });
   });
 
   app.post('/api/tenants', requireRole('landlord', 'admin'), async (req, res) => {
@@ -3496,24 +3513,7 @@ async function startServer() {
       return res.json({ success: true, data: dbPayments });
     }
 
-    // Degraded development fallback only. It stays scoped to the caller so a failed
-    // database read never turns into a cross-account data leak.
-    let results = user?.role === 'admin'
-      ? [...payments]
-      : user?.role === 'tenant'
-        ? payments.filter((payment) => tenants.some((tenant) => tenant.userId === user.sub && tenant.id === payment.tenantId))
-        : payments.filter((payment) => {
-          const tenant = tenants.find((item) => item.id === payment.tenantId);
-          const unit = tenant?.unitId ? units.find((item) => item.id === tenant.unitId) : undefined;
-          return Boolean(unit && properties.some((property) => property.id === unit.propertyId && property.landlordId === user?.sub));
-        });
-    if (tenantId) {
-      results = results.filter((payment) => payment.tenantId === tenantId);
-    }
-    if (status) {
-      results = results.filter((payment) => payment.status === status);
-    }
-    res.json({ success: true, data: results });
+    return res.status(503).json({ success: false, error: 'Payments are temporarily unavailable. Please try again shortly.' });
   });
 
   app.post('/api/payments', requireRole('landlord', 'admin'), async (req, res) => {
@@ -3646,32 +3646,7 @@ async function startServer() {
       return res.json({ success: true, data: dbRequests });
     }
 
-    let results = [...maintenanceRequests];
-    if (user?.role === 'tenant') {
-      const tenant = tenants.find((item) => item.userId === user.sub);
-      results = tenant ? results.filter((request) => request.tenantId === tenant.id) : [];
-    } else if (tenantId) {
-      results = results.filter((request) => request.tenantId === tenantId);
-    }
-    if (propertyId) results = results.filter((request) => request.propertyId === propertyId);
-    if (status) results = results.filter((request) => request.status === status);
-    if (user?.role === 'landlord') {
-      results = results.filter((request) => properties.some((property) => property.id === request.propertyId && property.landlordId === user.sub));
-    }
-    return res.json({
-      success: true,
-      data: results.map((request) => {
-        const tenant = tenants.find((item) => item.id === request.tenantId);
-        const unit = units.find((item) => item.id === request.unitId);
-        const property = properties.find((item) => item.id === request.propertyId);
-        return {
-          ...request,
-          propertyName: property?.name ?? 'Unknown property',
-          unitNumber: unit?.number ?? 'Unknown unit',
-          tenantName: tenant ? `${tenant.firstName} ${tenant.lastName}` : 'Unknown tenant',
-        };
-      }),
-    });
+    return res.status(503).json({ success: false, error: 'Maintenance requests are temporarily unavailable. Please try again shortly.' });
   });
 
   app.post('/api/maintenance', async (req, res) => {
@@ -3737,29 +3712,7 @@ async function startServer() {
       return res.status(201).json({ success: true, data: dbResult.data });
     }
 
-    const tenant = user?.role === 'tenant'
-      ? tenants.find((item) => item.userId === user.sub)
-      : tenants.find((item) => item.id === requestedTenantId);
-    if (!tenant?.unitId || (user?.role !== 'tenant' && tenant.unitId !== unitId)) {
-      return res.status(400).json({ success: false, error: 'A tenant assigned to this unit is required.' });
-    }
-    unitId = tenant.unitId;
-    const unit = units.find((item) => item.id === unitId);
-    const property = unit && properties.find((item) => item.id === unit.propertyId);
-    if (!unit || !property || (user?.role !== 'tenant' && property.id !== propertyId)) {
-      return res.status(404).json({ success: false, error: 'Unit or property not found.' });
-    }
-    propertyId = property.id;
-    if (user?.role === 'landlord' && property.landlordId !== user.sub) {
-      return res.status(403).json({ success: false, error: 'You do not have access to this property.' });
-    }
-
-    const request: MaintenanceRequest = {
-      id: createId('maintenance'), propertyId, unitId, tenantId: tenant.id, title, description,
-      status: 'open', priority: priority as MaintenanceRequest['priority'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    };
-    maintenanceRequests.push(request);
-    return res.status(201).json({ success: true, data: request });
+    return res.status(503).json({ success: false, error: 'Maintenance requests are temporarily unavailable. Please try again shortly.' });
   });
 
   app.patch('/api/maintenance/:id', requireRole('landlord', 'admin'), async (req, res) => {
@@ -3807,20 +3760,7 @@ async function startServer() {
       return res.json({ success: true, data: dbResult.data });
     }
 
-    const request = maintenanceRequests.find((item) => item.id === req.params.id);
-    const tenant = request && tenants.find((item) => item.id === request.tenantId);
-    const property = request && properties.find((item) => item.id === request.propertyId);
-    if (!request || !tenant || !property || (user?.role === 'landlord' && property.landlordId !== user.sub)) {
-      return res.status(404).json({ success: false, error: 'Maintenance request not found.' });
-    }
-    Object.assign(request, {
-      ...(status !== undefined ? { status } : {}),
-      ...(priority !== undefined ? { priority } : {}),
-      ...(title !== undefined ? { title: sanitizeString(title) } : {}),
-      ...(description !== undefined ? { description: sanitizeString(description) } : {}),
-      updatedAt: new Date().toISOString(),
-    });
-    return res.json({ success: true, data: request });
+    return res.status(503).json({ success: false, error: 'Maintenance requests are temporarily unavailable. Please try again shortly.' });
   });
 
   app.get('/api/messages', async (req, res) => {

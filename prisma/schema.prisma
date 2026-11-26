@@ -352,6 +352,19 @@ model RateLimitCounter {
   @@index([resetAt])
 }
 
+/// Minimal durable Resend delivery history. Never store recipient addresses or message content.
+model EmailDeliveryEvent {
+  providerEventId String   @id
+  emailId         String?
+  eventType       String
+  occurredAt      DateTime
+  receivedAt      DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([emailId, occurredAt])
+  @@index([eventType, occurredAt])
+}
+
 /// Time-boxed, single-use password reset request. The token itself only ever exists in the link.
 model PasswordResetToken {
   id        String    @id @default(cuid())

@@ -18,6 +18,7 @@ A privacy-first property management platform for landlords, tenants, and platfor
 - [API surface](#api-surface)
 - [Data model](#data-model)
 - [Frontend map](#frontend-map)
+- [Progressive web app](#progressive-web-app)
 - [Product constraints](#product-constraints)
 - [Security posture and known gaps](#security-posture-and-known-gaps)
 - [Troubleshooting](#troubleshooting)
@@ -40,15 +41,15 @@ A privacy-first property management platform for landlords, tenants, and platfor
 - Fraud/conduct reports with admin review, explicit trust-score adjustment, and manual blacklist flags.
 - Admin area: overview metrics, user directory, verification review queue, contact enquiry inbox, and an append-only admin action log.
 - Verification decisions are recorded as a `VerificationReview` (reviewer + basis + from/to status), not inferred from a checkbox.
+- Resend sends and signed delivery webhooks are recorded in PostgreSQL without storing recipient addresses or message content.
+- Production builds support install-to-home-screen and an offline app shell; authenticated API data is never cached.
 - Helmet CSP, CORS allowlist, per-route rate limiting, and a global auth gate over `/api`.
-- Six committed Prisma migrations.
+- Eight committed Prisma migrations.
 
 **Not built yet**
 
-- Configure the production Resend sender and webhook in the provider dashboard, and set their secrets in the production environment. Resend alerts and durable email event history remain operational setup work.
+- Configure the production Resend sender, webhook, and provider alerts in the Resend dashboard, then set their secrets in the production environment. This account-level setup remains before launch.
 - Payment provider, KYC vendor, OTP provider, and payout onboarding.
-- Durable persistence for remaining legacy dashboard routes — several still fall back to in-memory fixtures.
-- Durable access-token revocation, cookie-based browser sessions, and shared rate-limit state for multi-instance deployments.
 - Production deployment, observability, backup/restore procedures, and a CI test gate.
 
 ## Stack
@@ -59,7 +60,7 @@ A privacy-first property management platform for landlords, tenants, and platfor
 | Backend | Express 4 in a single `server.ts`, executed with `tsx` |
 | Auth | `jsonwebtoken` (HS256, 2h) + `bcryptjs` |
 | Data | PostgreSQL 18 + Prisma 7 via `@prisma/adapter-pg` |
-| Hardening | `helmet` CSP, CORS allowlist, `express-rate-limit` |
+| Hardening | `helmet` CSP, CORS/Origin checks, HttpOnly sessions, PostgreSQL-backed `express-rate-limit` |
 | Email | Resend; invitations, password-reset links, and email-confirmation links |
 
 ## Quick start
@@ -116,6 +117,7 @@ Seeding is blocked when `NODE_ENV=production` and upserts `admin@propmanage.saas
 | `EMAIL_FROM` | yes in production | Sender identity on a domain verified in Resend. The development default `PropManage <onboarding@resend.dev>` is rejected in production. |
 | `RESEND_WEBHOOK_SECRET` | yes in production | Signing secret for the `/api/webhooks/resend` endpoint. Add that HTTPS endpoint in Resend and subscribe to sent, delivered, delayed, bounced, failed, suppressed, and complained events. |
 | `AUTH_RATE_LIMIT_MAX` | no | Failed `/api/auth/*` requests allowed per IP per 15-minute window; defaults to `5`. |
+| `RATE_LIMIT_NAMESPACE` | no | Prefix for shared PostgreSQL rate-limit counters; set the same value on every instance of one deployment. |
 | `NODE_ENV` | no | `production` serves `dist/` statically, drops dev WebSocket CSP entries, and blocks seeding. |
 | `PG_BIN`, `DB_PORT` | no | Override the PostgreSQL binaries directory or cluster port for `scripts/db.mjs`. |
 
@@ -133,7 +135,7 @@ Never commit `.env`. `.env*`, `.pgdata/`, `uploads/`, and `AGENTS.md`, are git-i
 | `npm run prisma:migrate` | `prisma migrate dev --name init` — adjust the name for new migrations. |
 | `npm run db:seed` | Seeds demo accounts and fixtures. |
 | `npm run db:start` / `db:stop` / `db:status` | Control and inspect the local `.pgdata` cluster. |
-| `node scripts/verify-security.mjs` | Runs account/session/reset/email/MFA regression checks against the configured database and a running server. Use only with a disposable local test database. |
+| `node scripts/verify-security.mjs` | Runs account/session/reset/email/MFA regression checks against the configured database and a running server using cookie sessions. Use only with a disposable local test database. |
 | `node scripts/temp-ui-security.mjs create|clean` | Temporary browser-check admin helper; requires `ALLOW_TEMP_QA_ADMIN=true`, refuses production, and only accepts loopback database hosts. Use only with a disposable local database. |
 | `NODE_ENV=production node scripts/bootstrap-admin.mjs --confirm-bootstrap` | One-time production bootstrap; prompts for the first administrator and a hidden initial password. Refuses to run if an admin already exists. The created account must enroll MFA before admin APIs unlock. |
 | `node scripts/recover-admin-mfa.mjs admin@example.com` | Operator recovery after independent identity verification. Requires distinct `ADMIN_RECOVERY_OPERATOR` and `ADMIN_RECOVERY_APPROVER`; revokes sessions and records an audit event. Add `--confirm-production-recovery` in production. |
@@ -146,7 +148,7 @@ Never commit `.env`. `.env*`, `.pgdata/`, `uploads/`, and `AGENTS.md`, are git-i
 Order matters when debugging CORS, auth, or 429s:
 
 1. `helmet` CSP — allows self, Google Fonts, `images.unsplash.com`, and dev WebSockets only.
-2. CORS with an explicit origin allowlist. Requests without an `Origin` header pass; anything else must be listed in `ALLOWED_ORIGINS`.
+2. CORS with an explicit origin allowlist, then an Origin check on unsafe requests using session cookies. Cookie-authenticated state changes require an allowed `Origin`.
 3. Body parsers: JSON up to 10 MB, urlencoded up to 32 KB (avatar uploads use their own raw parser).
 4. `/uploads` static serving for avatars, cached for 7 days.
 5. Rate limiters: `/api` 100/min, `/api/auth` 5 per 15 min (successful requests skipped), registration 5/hour, invitation create 20/hour, invitation accept 10/15 min.
@@ -158,13 +160,14 @@ Order matters when debugging CORS, auth, or 429s:
 - **Registration** takes first name, last name, email, password, role (`landlord` | `tenant`), and an optional phone. Admins cannot self-register.
 - **Passwords**: 12–72 UTF-8 bytes, trimmed before hashing, bcrypt cost 12. The same rule applies to registration, invitation acceptance, profile password change, and admin password rotation.
 - **Login** lowercases the email and returns one message for both bad email and bad password.
-- **Session**: signed HS256 access JWT valid for **2 hours**, plus a **30-day rotating refresh token**. Only the SHA-256 hash of each refresh token is stored in PostgreSQL. Replaying a rotated token revokes active refresh sessions for that user.
-- **Storage**: access token, refresh token, and user profile are stored in `localStorage`. On mount the app calls `GET /api/auth/me`; an expired access token is refreshed when possible. XSS can steal browser-stored tokens; HttpOnly cookies with CSRF protection are a safer production target.
+- **Session**: signed HS256 access JWT valid for **2 hours**, plus a **30-day rotating refresh token**. Both are HttpOnly, SameSite=Lax cookies; production cookies use Secure and the `__Host-` prefix. The refresh token is stored only as a SHA-256 hash in PostgreSQL. Browser code never receives either token.
+- **Session validation**: each access JWT carries a `jti` linked to its refresh-session row. Every authenticated request checks that row in PostgreSQL, so logout, rotation, password changes, and sign-out-everywhere revoke access immediately across all instances. Replaying a rotated refresh token revokes the user's active sessions.
+- **Browser profile**: non-secret profile display data stays in `localStorage`; the app validates it with `GET /api/auth/me` on load. Origin checks plus SameSite cookies protect cookie-authenticated state changes against CSRF. Existing browser sessions must sign in again after the session migration.
 - **Password reset**: request responses do not reveal whether an email exists. Reset tokens are stored hashed, expire in 60 minutes, are single-use, and revoke refresh sessions after a successful reset.
 - **Email confirmation**: one-time link expires after 24 hours and creates a `VerificationReview`. This proves inbox access only, not identity, phone, or property ownership.
 - **Admin MFA**: required authenticator-app TOTP with hashed, single-use recovery codes. Password-only login for an unenrolled admin grants access only to MFA enrollment, account identity, and session management endpoints. Admin APIs are checked against the current database MFA state.
 - **Endpoints**: auth register/login/logout/logout-all/refresh/sessions/password-reset/email-confirmation/MFA/admin-password-rotation; account profile/password/avatar endpoints.
-- **Revocation**: refresh-token revocation is database-backed. Access-token `jti` blacklist and in-process cutoff checks remain memory-based; a restart loses those checks, and multiple instances do not share them. A revoked access JWT may remain usable until its two-hour expiry.
+- **Revocation**: access and refresh token revocation state is database-backed in the refresh-session row and is checked for every authenticated request.
 - **Avatar uploads**: PNG/JPG/GIF only, 800 KB cap, extension derived from the file signature rather than the declared `Content-Type`, served from `/uploads/avatars`.
 
 ### Rate limits
@@ -177,22 +180,21 @@ Order matters when debugging CORS, auth, or 429s:
 | Invitation create | 20 / hour / landlord |
 | Invitation accept | 10 / 15 minutes / IP |
 
-These are tight on purpose and are the most common cause of a "broken" login during development.
-`AUTH_RATE_LIMIT_MAX` overrides the failed-request limit (default `5`). Rate-limit counters use the process-local default store; configure a shared store before horizontal scaling.
+These are tight on purpose and are the most common cause of a "broken" login during development. `AUTH_RATE_LIMIT_MAX` overrides the failed-request limit (default `5`). Counters use PostgreSQL fixed windows shared by all instances that use the same database and `RATE_LIMIT_NAMESPACE`; they persist across process restarts until their window expires.
 
 ### Error contract
 
 | Status | Meaning |
 | --- | --- |
 | `400` | Missing/invalid field, weak password, or a rejected state transition |
-| `401` | Bad credentials, missing/expired/revoked token (also unknown `/api` paths) |
-| `403` | Authenticated but the role is not allowed |
+| `401` | Bad credentials, missing/expired/revoked session (also unknown `/api` paths) |
+| `403` | Authenticated but the role is not allowed, or admin MFA enrollment is required |
 | `404` | Known route, unknown record |
 | `409` | Email already registered |
 | `429` | Rate limited |
 | `503` | Database unreachable or query failed |
 
-`503` is deliberate. Account, report, contact, and admin writes have **no** in-memory fallback: if PostgreSQL is down, the API errors instead of faking success. Legacy dashboard CRUD still falls back to fixtures, so a working dashboard does not prove the database is wired.
+`503` is deliberate. Account, report, contact, admin, and dashboard CRUD have **no** in-memory fallback: if PostgreSQL is down, the API errors instead of faking success. Seeded/demo rows are only created by the explicit local seed command.
 
 ## API surface
 
@@ -206,19 +208,20 @@ Routes under `/api` are JSON. Storage is noted per group — that is where the r
 | Account | `PATCH /api/users/me`, `POST /api/users/me/password`, `POST /api/users/me/avatar` | DB + disk |
 | Invitations | create (landlord), fetch by token, accept | DB |
 | Admin | `overview`, `users`, `contact-inquiries` (list + status), `audit`, `users/:id/verification` (read + record) | DB |
+| Email delivery | `GET /api/admin/email-delivery` | DB; admin-only, metadata only |
 | Dashboard | `GET /api/dashboard-stats` | DB counts |
 | Reports | create, list, review (`PATCH /api/reports/:id`) | DB |
-| Properties | list, read, create, update, delete | DB with fixture fallback |
-| Units | list, create, update, delete, `PUT /api/units/:id/listing` | DB with fixture fallback |
-| Tenants | list, create, update, delete | DB with fixture fallback |
-| Payments / maintenance / messages / documents | list + create, maintenance update | mixed; payments remain records only, not provider transactions |
+| Properties | list, read, create, update, delete | DB; returns `503` if unavailable |
+| Units | list, create, update, delete, `PUT /api/units/:id/listing` | DB; returns `503` if unavailable |
+| Tenants | list, create, update, delete | DB; returns `503` if unavailable |
+| Payments / maintenance / messages / documents | list + create, maintenance update | DB; payments remain records only, not provider transactions |
 | Viewing requests | tenant create/list, landlord update | DB |
 
 Admin-only routes are the ones under `/api/admin` plus `PATCH /api/reports/:id`. Reviewing a report can adjust `trustScore` and set `blacklisted`; both are recorded in the audit log with the acting admin.
 
 ## Data model
 
-17 models: `User`, `Property`, `Unit`, `Tenant`, `TenantInvitation`, `Payment`, `MaintenanceRequest`, `Message`, `Document`, `ViewingRequest`, `Report`, `ContactInquiry`, `AuditLog`, `RefreshToken`, `PasswordResetToken`, `EmailVerificationToken`, `VerificationReview`.
+19 models: `User`, `Property`, `Unit`, `Tenant`, `TenantInvitation`, `Payment`, `MaintenanceRequest`, `Message`, `Document`, `ViewingRequest`, `Report`, `ContactInquiry`, `AuditLog`, `RefreshToken`, `RateLimitCounter`, `EmailDeliveryEvent`, `PasswordResetToken`, `EmailVerificationToken`, `VerificationReview`.
 
 Two are security-relevant:
 
@@ -234,6 +237,8 @@ Migrations are committed and linear:
 20261114222910_add_audit_log
 20261114223608_add_verification_review
 20261116094932_add_sessions_and_second_factor
+20261124150000_durable_sessions_and_shared_rate_limits
+20261124160000_email_delivery_history
 ```
 
 Apply with `npx prisma migrate dev` locally and `npx prisma migrate deploy` anywhere shared. Never run `migrate reset` against a database you care about.
@@ -247,7 +252,13 @@ Apply with `npx prisma migrate dev` locally and `npx prisma migrate deploy` anyw
 | Landlord | `/landlord` + `properties`, `properties/:id`, `units`, `viewings`, `tenants`, `payments`, `reports`, `messages`, `maintenance`, `analytics`, `settings` |
 | Admin | `/admin` + `properties`, `units`, `tenants`, `payments`, `messages`, `maintenance`, `analytics`, `reports`, `settings` |
 
-`RequireAuth` guards client routes; the API re-checks token and role on every non-public path, so hiding a route is never the only control.
+`RequireAuth` guards client routes; the API re-checks session and role on every non-public path, so hiding a route is never the only control.
+
+## Progressive web app
+
+Production builds include an installable web app manifest, branded icon, and service worker. The worker caches only the app shell and versioned static assets so the interface can open offline after a successful first load. It never caches `/api` responses, uploaded files, or authenticated property data. Actions that need the server remain unavailable offline; this PWA is for installation and shell reliability, not offline record editing.
+
+Service workers require HTTPS in production (localhost is allowed during development). After a release, close and reopen the installed app if an older shell is still open.
 
 ### Design tokens
 
@@ -280,15 +291,12 @@ These are candidates for evaluation, not integrated or selected providers. Confi
 
 ## Security posture and known gaps
 
-Implemented: parameterised Prisma access, bcrypt hashing, role gates, Helmet CSP, CORS allowlist, route-specific rate limits, magic-byte avatar validation, hashed single-use invitation/reset/verification tokens, rotating database-backed refresh tokens, required admin TOTP with hashed recovery codes, restricted password-only admin enrollment, one-time bootstrap and audited two-operator MFA recovery scripts, audit records for admin decisions, and production static-file rules that withhold server bundles and source maps.
+Implemented: parameterised Prisma access, bcrypt hashing, role gates, Helmet CSP, CORS/Origin protections, HttpOnly browser cookies, database-checked access-token revocation, shared PostgreSQL rate limits, magic-byte avatar validation, hashed single-use invitation/reset/verification tokens, rotating database-backed refresh tokens, required admin TOTP with hashed recovery codes, restricted password-only admin enrollment, one-time bootstrap and audited two-operator MFA recovery scripts, durable Resend event history with an admin-only view, database-only legacy dashboard reads/writes, audit records for admin decisions, and production static-file rules that withhold server bundles and source maps.
 
 Close these before production:
 
-- **Monitor email delivery.** Production startup requires Resend credentials, a non-default sender, and a webhook secret. `/api/webhooks/resend` verifies signed events; health exposes the latest in-process event/state, and logs omit recipient addresses and message content. Configure the endpoint and Resend dashboard alerts for delayed delivery, bounces, complaints, and failures. Password-reset responses remain generic to avoid account enumeration, while naming support as the fallback if no email arrives. This app-side health state is not a durable event history.
-- **Protect browser sessions from XSS.** Access and refresh tokens are stored in `localStorage`; move them to HttpOnly, Secure, SameSite cookies with CSRF protection before production.
-- **Make access-token revocation durable.** Refresh-token revocation is in PostgreSQL, but the access-token `jti` blacklist and logout-all cutoff are in memory. A restart loses them and multiple instances do not share them.
-- **Use shared rate-limit state when scaling.** The default `express-rate-limit` store is process-local; use a shared store such as Redis for multiple instances.
-- **Remove fixture fallbacks.** Legacy dashboard CRUD may serve in-memory fixtures on database errors; remove those paths before relying on production persistence.
+- **Finish Resend operations.** Production startup requires `RESEND_API_KEY`, a verified `EMAIL_FROM`, and `RESEND_WEBHOOK_SECRET`. Configure the production sender domain, add `https://<production-host>/api/webhooks/resend`, subscribe to sent, delivered, delayed, bounced, failed, suppressed, and complained events, and enable alerts in Resend. Delivery events persist in PostgreSQL; `GET /api/health` reports recent failures and `GET /api/admin/email-delivery` shows the latest 100 events to admins. Set secrets in the deployment environment and test a real reset email before launch. Keep password-reset responses generic to avoid account enumeration.
+- **Check production persistence.** Property, unit, tenant, payment-record, and maintenance routes now rely on PostgreSQL and return `503` when it is unavailable. Payment rows are still manual records; a payment provider is not integrated.
 - **Keep QA scripts local-only.** `scripts/temp-ui-security.mjs` contains a fixed admin test credential and deletes/recreates the same test email. It must only be run against a disposable local database.
 - **Add operational checks.** There is no CI test gate, structured logging, metrics/alerting, or verified backup/restore procedure yet.
 
@@ -299,7 +307,7 @@ Close these before production:
 | Boot fails with a `JWT_SECRET` error | Secret under 32 characters | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` and paste into `.env` |
 | Login/register returns `503` | Database down or unmigrated | `npm run db:start`, check `DATABASE_URL`, then `npx prisma migrate dev` |
 | `PrismaClient` type errors after a schema edit | Client not regenerated | `npx prisma generate`, then `npm run lint` |
-| Login returns `429` | 5 failed `/api/auth/*` requests in 15 minutes | Wait out the window or clear `propmanage_token` |
+| Login returns `429` | 5 failed `/api/auth/*` requests in 15 minutes | Wait for the shared database window to expire, or adjust `AUTH_RATE_LIMIT_MAX` |
 | CORS error in the server log | Origin not in the allowlist — `127.0.0.1:3000` is **not** the same origin as `localhost:3000` | Use `http://localhost:3000`, or add the origin to `ALLOWED_ORIGINS` |
 | Vite modules return `500` in the browser | The same CORS rejection, surfaced through Vite middleware | Same fix as above |
 | Logged out immediately after reload | `/api/auth/me` failed, so the client cleared the session | Inspect the API log; usually an expired token |
@@ -309,12 +317,12 @@ Close these before production:
 
 ## Roadmap
 
-1. **Production account security**: move tokens to HttpOnly cookies; make access-session revocation durable across restarts and instances.
-2. **Account email**: set production secrets and a verified sender; configure Resend events and alerts, then add durable delivery-event history while keeping reset responses account-enumeration safe.
+1. **Account security operations**: deploy the session/rate-limit/email-history migrations, require synchronized app configuration and database access across instances, and rehearse admin recovery.
+2. **Account email**: configure the production Resend sender, webhook, and alerts; add an external monitor for `/api/health`; keep reset responses account-enumeration safe.
 3. **Payments**: a Nigeria-capable provider for rent and connected-account payouts, with webhooks and reconciliation.
 4. **Verification providers**: KYC and phone-OTP vendors, provider callbacks, automatic expiry, and audit on every status change.
-5. **Persistence pass**: move remaining dashboard CRUD off fixtures and delete the fallbacks.
-6. **Deployment hardening**: use a shared rate-limit store when scaling, and add dependency/security checks to CI.
+5. **Persistence pass**: review any remaining fixture-backed UI and ensure demo content is visibly labeled; backend CRUD now fails closed when the database is unavailable.
+6. **Deployment hardening**: add dependency/security checks to CI and verify database connectivity, email alerts, and rate-counter cleanup at scale.
 7. **Legal and operations**: Nigeria-specific privacy review, retention policy, production deployment, backups, restore drills, and incident response.
 
 ## Conventions
