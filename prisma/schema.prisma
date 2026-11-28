@@ -24,6 +24,21 @@ enum PaymentStatus {
   overdue
 }
 
+enum RentReminderKind {
+  six_months_before
+  three_months_before
+  three_months_overdue
+  six_months_overdue
+}
+
+enum RentReminderStatus {
+  pending
+  processing
+  sent
+  failed
+  skipped
+}
+
 enum MaintenanceStatus {
   open
   in_progress
@@ -254,8 +269,29 @@ model Payment {
   paidDate  DateTime?
   status    PaymentStatus @default(pending)
   method    String
+  reminders RentReminder[]
   createdAt DateTime      @default(now())
   updatedAt DateTime      @updatedAt
+}
+
+/// Idempotent scheduled notices around an unpaid rent payment's due date.
+model RentReminder {
+  id           String            @id @default(cuid())
+  paymentId    String
+  payment      Payment           @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  kind         RentReminderKind
+  status       RentReminderStatus @default(pending)
+  scheduledAt  DateTime
+  processingAt DateTime?
+  sentAt       DateTime?
+  attempts     Int               @default(0)
+  lastError    String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  @@unique([paymentId, kind])
+  @@index([status, scheduledAt])
+  @@index([paymentId, scheduledAt])
 }
 
 model MaintenanceRequest {

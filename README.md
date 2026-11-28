@@ -42,9 +42,10 @@ A privacy-first property management platform for landlords, tenants, and platfor
 - Admin area: overview metrics, user directory, verification review queue, contact enquiry inbox, and an append-only admin action log.
 - Verification decisions are recorded as a `VerificationReview` (reviewer + basis + from/to status), not inferred from a checkbox.
 - Resend sends and signed delivery webhooks are recorded in PostgreSQL without storing recipient addresses or message content.
+- Unpaid rent records get six- and three-month advance notices plus three- and six-month overdue notices by email and in the tenant payment area.
 - Production builds support install-to-home-screen and an offline app shell; authenticated API data is never cached.
 - Helmet CSP, CORS allowlist, per-route rate limiting, and a global auth gate over `/api`.
-- Eight committed Prisma migrations.
+- Nine Prisma migrations are included.
 
 **Not built yet**
 
@@ -170,6 +171,19 @@ Order matters when debugging CORS, auth, or 429s:
 - **Revocation**: access and refresh token revocation state is database-backed in the refresh-session row and is checked for every authenticated request.
 - **Avatar uploads**: PNG/JPG/GIF only, 800 KB cap, extension derived from the file signature rather than the declared `Content-Type`, served from `/uploads/avatars`.
 
+### Tenant invitations and rent flow
+
+- Landlords invite an email address to a vacant unit they own. The seven-day, single-use link shows the landlord, property, unit, rent, and lease dates before acceptance.
+- Acceptance atomically creates the tenant account, links it to the landlord and unit, updates occupancy, and consumes the invitation. The tenant is signed in and routed to `/tenant`; APIs scope their data to that account.
+- Each rent `Payment` row is currently a manually created ledger record. It does not charge the tenant or transfer money. Online payment and autopay controls remain disabled until a provider integration ships. The tenant dashboard's move-in checklist and payment trend chart are illustrative and are not persisted.
+- For each unpaid payment record, the reminder worker queues email notices six and three calendar months before the due date and three and six months after. It checks every 15 minutes, retries failures, deduplicates each notice by payment and offset, and shows sent/failed notices on the tenant payments page. It does not create recurring invoices; landlords must create a payment record for each due date.
+
+### Proposed landlord payout and tenant payment setup
+
+For Nigeria-first rent collection, evaluate Paystack subaccounts before coding live charges. Each landlord would complete provider onboarding and payout-account verification; the platform stores the provider subaccount code, not raw bank details. The tenant would pay a server-created rent invoice through provider checkout, and the charge would split so the landlord's share settles to that landlord's subaccount. Decide whether the platform charges a fee and who bears provider fees, and confirm marketplace/subaccount eligibility with Paystack. [Paystack subaccounts](https://paystack.com/docs/v2/payments/split-payments/subaccounts), [split payments](https://paystack.com/docs/v2/payments/split-payments), [transaction verification](https://paystack.com/docs/v2/payments/online/verify-payments).
+
+The server must create charges using its secret key, verify the final amount, currency, and reference from signed webhooks (and the verify endpoint for reconciliation), and update the ledger once using a unique provider reference. A browser redirect alone does not prove payment. Provider checkout and landlord payout onboarding are not implemented yet.
+
 ### Rate limits
 
 | Scope | Limit |
@@ -214,14 +228,14 @@ Routes under `/api` are JSON. Storage is noted per group — that is where the r
 | Properties | list, read, create, update, delete | DB; returns `503` if unavailable |
 | Units | list, create, update, delete, `PUT /api/units/:id/listing` | DB; returns `503` if unavailable |
 | Tenants | list, create, update, delete | DB; returns `503` if unavailable |
-| Payments / maintenance / messages / documents | list + create, maintenance update | DB; payments remain records only, not provider transactions |
+| Payments / maintenance / messages / documents | list + create, maintenance update | DB; reminders are scheduled for recorded payments; payments remain records only, not provider transactions |
 | Viewing requests | tenant create/list, landlord update | DB |
 
 Admin-only routes are the ones under `/api/admin` plus `PATCH /api/reports/:id`. Reviewing a report can adjust `trustScore` and set `blacklisted`; both are recorded in the audit log with the acting admin.
 
 ## Data model
 
-19 models: `User`, `Property`, `Unit`, `Tenant`, `TenantInvitation`, `Payment`, `MaintenanceRequest`, `Message`, `Document`, `ViewingRequest`, `Report`, `ContactInquiry`, `AuditLog`, `RefreshToken`, `RateLimitCounter`, `EmailDeliveryEvent`, `PasswordResetToken`, `EmailVerificationToken`, `VerificationReview`.
+20 models: `User`, `Property`, `Unit`, `Tenant`, `TenantInvitation`, `Payment`, `RentReminder`, `MaintenanceRequest`, `Message`, `Document`, `ViewingRequest`, `Report`, `ContactInquiry`, `AuditLog`, `RefreshToken`, `RateLimitCounter`, `EmailDeliveryEvent`, `PasswordResetToken`, `EmailVerificationToken`, `VerificationReview`.
 
 Two are security-relevant:
 
@@ -239,6 +253,7 @@ Migrations are committed and linear:
 20261116094932_add_sessions_and_second_factor
 20261124150000_durable_sessions_and_shared_rate_limits
 20261124160000_email_delivery_history
+20261126110000_rent_reminders
 ```
 
 Apply with `npx prisma migrate dev` locally and `npx prisma migrate deploy` anywhere shared. Never run `migrate reset` against a database you care about.
@@ -295,7 +310,11 @@ Implemented: parameterised Prisma access, bcrypt hashing, role gates, Helmet CSP
 
 Close these before production:
 
-- **Finish Resend operations.** Production startup requires `RESEND_API_KEY`, a verified `EMAIL_FROM`, and `RESEND_WEBHOOK_SECRET`. Configure the production sender domain, add `https://<production-host>/api/webhooks/resend`, subscribe to sent, delivered, delayed, bounced, failed, suppressed, and complained events, and enable alerts in Resend. Delivery events persist in PostgreSQL; `GET /api/health` reports recent failures and `GET /api/admin/email-delivery` shows the latest 100 events to admins. Set secrets in the deployment environment and test a real reset email before launch. Keep password-reset responses generic to avoid account enumeration.
+- **Put the origin behind Cloudflare.** Proxy the production DNS records through Cloudflare and use Full (strict) TLS. Restrict the origin firewall to Cloudflare IP ranges, or use Cloudflare Tunnel so clients cannot bypass edge controls by connecting directly to the app host. The server trusts one reverse-proxy hop for client IP rate limiting; keep that hop count accurate for the deployed topology. Keep the PostgreSQL-backed application rate limits enabled as a second layer.
+- **Enable edge abuse controls.** Start with Cloudflare Managed Rules and Bot Fight Mode, then review Security Events for false positives. Add rate-limiting rules for `/api/auth/login`, `/api/auth/register`, `/api/auth/password-reset/request`, `/api/tenant-invitations/*`, and `/api/contact`; use Managed Challenge for suspicious traffic and avoid broad challenges on API traffic until browser and PWA flows have been checked. Cloudflare counters can allow a small burst through, so they complement rather than replace the app's limits.
+- **Add Turnstile to public forms if abuse continues.** Turnstile only protects a form when the server validates each submitted token with Siteverify; a browser widget by itself is not a security check. Use separate development and production widgets, restrict allowed hostnames, and keep the secret key only in the server environment.
+
+- **Finish Resend operations.** In Resend, verify the production sender domain (including its DNS records), create a sending API key, and add `https://<production-host>/api/webhooks/resend`. Subscribe to sent, delivered, delayed, bounced, failed, suppressed, and complained events; copy the webhook signing secret to `RESEND_WEBHOOK_SECRET`. Set `RESEND_API_KEY`, `EMAIL_FROM`, `RESEND_WEBHOOK_SECRET`, and an HTTPS `APP_URL` in the production environment. Delivery events persist in PostgreSQL; `GET /api/health` reports failures from the last 24 hours and `GET /api/admin/email-delivery` shows the latest 100 events to admins. Configure Resend alerts plus an external monitor for `/api/health`, then test a real password reset to a controlled mailbox before launch. Password-reset responses stay generic to avoid account enumeration, so watch delivery health and provide a support path for users who do not receive a reset link.
 - **Check production persistence.** Property, unit, tenant, payment-record, and maintenance routes now rely on PostgreSQL and return `503` when it is unavailable. Payment rows are still manual records; a payment provider is not integrated.
 - **Keep QA scripts local-only.** `scripts/temp-ui-security.mjs` contains a fixed admin test credential and deletes/recreates the same test email. It must only be run against a disposable local database.
 - **Add operational checks.** There is no CI test gate, structured logging, metrics/alerting, or verified backup/restore procedure yet.
@@ -313,11 +332,12 @@ Close these before production:
 | Logged out immediately after reload | `/api/auth/me` failed, so the client cleared the session | Inspect the API log; usually an expired token |
 | `EADDRINUSE :3000` | A previous dev server is still alive | `netstat -ano \| findstr :3000`, then `Stop-Process -Id <pid> -Force` |
 | Invitation email never arrives | Resend is not configured or the provider rejected the send | In development, check the server log for the invitation link; in production, inspect Resend logs and the signed delivery webhook state |
+| PWA install option is missing | Production is not served over HTTPS or the manifest/service worker failed to load | Use HTTPS, then inspect the browser console and Application panel for manifest and service-worker errors |
 | `npm run build` exits non-zero after printing `✓ built` | PowerShell turns npm's stderr notes into a native-command error | Check for `dist/server.cjs`; the build itself succeeded |
 
 ## Roadmap
 
-1. **Account security operations**: deploy the session/rate-limit/email-history migrations, require synchronized app configuration and database access across instances, and rehearse admin recovery.
+1. **Account security operations**: deploy all committed migrations, including rent reminders, require synchronized app configuration and database access across instances, and rehearse admin recovery.
 2. **Account email**: configure the production Resend sender, webhook, and alerts; add an external monitor for `/api/health`; keep reset responses account-enumeration safe.
 3. **Payments**: a Nigeria-capable provider for rent and connected-account payouts, with webhooks and reconciliation.
 4. **Verification providers**: KYC and phone-OTP vendors, provider callbacks, automatic expiry, and audit on every status change.

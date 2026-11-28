@@ -339,6 +339,9 @@ async function persistEmailDeliveryEvent(providerEventId: string, emailId: strin
 }
 
 async function recordEmailSendFailure() {
+  emailDeliveryState = 'degraded';
+  emailLastEventAt = new Date().toISOString();
+  emailLastEventType = 'email.failed';
   try {
     await persistEmailDeliveryEvent(`send-failed:${randomUUID()}`, null, 'email.failed', new Date());
   } catch (error) {
@@ -346,7 +349,7 @@ async function recordEmailSendFailure() {
   }
 }
 
-async function sendAccountEmail(to: string, subject: string, text: string, html?: string) {
+async function sendAccountEmail(to: string, subject: string, text: string, html?: string, idempotencyKey?: string) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {
     emailDeliveryState = 'degraded';
@@ -356,7 +359,11 @@ async function sendAccountEmail(to: string, subject: string, text: string, html?
   try {
     const response = await fetch('https://api.resend.com/emails', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      },
       body: JSON.stringify({
         from: process.env.EMAIL_FROM || 'PropManage <onboarding@resend.dev>',
         to,
@@ -392,6 +399,148 @@ async function sendAccountEmail(to: string, subject: string, text: string, html?
     await recordEmailSendFailure();
     console.error('Account email delivery request failed:', error instanceof Error ? error.message : 'network error');
     return false;
+  }
+}
+
+const RENT_REMINDER_OFFSETS = [
+  { kind: 'six_months_before' as const, months: -6 },
+  { kind: 'three_months_before' as const, months: -3 },
+  { kind: 'three_months_overdue' as const, months: 3 },
+  { kind: 'six_months_overdue' as const, months: 6 },
+];
+
+function shiftCalendarMonths(date: Date, months: number) {
+  const year = date.getUTCFullYear();
+  const month = date.getUTCMonth() + months;
+  const day = date.getUTCDate();
+  const targetMonthStart = new Date(Date.UTC(year, month, 1));
+  const lastDay = new Date(Date.UTC(targetMonthStart.getUTCFullYear(), targetMonthStart.getUTCMonth() + 1, 0)).getUTCDate();
+  targetMonthStart.setUTCDate(Math.min(day, lastDay));
+  return targetMonthStart;
+}
+
+async function scheduleRentReminders(
+  client: Prisma.TransactionClient | typeof prisma,
+  paymentId: string,
+  dueDate: Date,
+) {
+  const now = new Date();
+  await client.rentReminder.createMany({
+    data: RENT_REMINDER_OFFSETS.map(({ kind, months }) => {
+      const scheduledAt = shiftCalendarMonths(dueDate, months);
+      return {
+        paymentId,
+        kind,
+        scheduledAt,
+        status: scheduledAt <= now ? 'skipped' as const : 'pending' as const,
+        ...(scheduledAt <= now ? { lastError: 'scheduled_time_has_passed' } : {}),
+      };
+    }),
+    skipDuplicates: true,
+  });
+}
+
+async function scheduleExistingRentReminders() {
+  const now = new Date();
+  const unscheduledPayments = await prisma.payment.findMany({
+    where: { status: { in: ['pending', 'overdue'] }, reminders: { none: {} } },
+    select: { id: true, dueDate: true },
+    orderBy: { id: 'asc' },
+    take: 200,
+  });
+  for (const payment of unscheduledPayments) {
+    await scheduleRentReminders(prisma, payment.id, payment.dueDate);
+  }
+  if (unscheduledPayments.length) {
+    console.info(`Scheduled rent notices for ${unscheduledPayments.length} existing payments as of ${now.toISOString()}.`);
+  }
+}
+
+async function processRentReminders() {
+  const now = new Date();
+  try {
+    const todayStartUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    await prisma.payment.updateMany({
+      where: { status: 'pending', dueDate: { lt: todayStartUtc } },
+      data: { status: 'overdue' },
+    });
+    await prisma.rentReminder.updateMany({
+      where: { status: 'processing', processingAt: { lt: new Date(now.getTime() - 10 * 60 * 1000) } },
+      data: { status: 'pending', processingAt: null, scheduledAt: now, lastError: 'worker_interrupted' },
+    });
+
+    const dueReminders = await prisma.rentReminder.findMany({
+      where: { status: 'pending', scheduledAt: { lte: now } },
+      include: {
+        payment: {
+          include: {
+            tenant: true,
+            unit: { include: { property: { include: { landlord: { select: { firstName: true, lastName: true } } } } } },
+          },
+        },
+      },
+      orderBy: { scheduledAt: 'asc' },
+      take: 50,
+    });
+
+    for (const reminder of dueReminders) {
+      const claimed = await prisma.rentReminder.updateMany({
+        where: { id: reminder.id, status: 'pending', scheduledAt: { lte: now } },
+        data: { status: 'processing', processingAt: now, attempts: { increment: 1 } },
+      });
+      if (claimed.count !== 1) continue;
+
+      if (reminder.payment.status === 'paid') {
+        await prisma.rentReminder.update({ where: { id: reminder.id }, data: { status: 'skipped', processingAt: null, lastError: 'payment_already_paid' } });
+        continue;
+      }
+      const tenant = reminder.payment.tenant;
+      if (!tenant.email) {
+        await prisma.rentReminder.update({ where: { id: reminder.id }, data: { status: 'failed', processingAt: null, lastError: 'tenant_email_missing' } });
+        continue;
+      }
+
+      const kindLabels: Record<(typeof RENT_REMINDER_OFFSETS)[number]['kind'], string> = {
+        six_months_before: 'Rent is due in six months',
+        three_months_before: 'Rent is due in three months',
+        three_months_overdue: 'Rent has been overdue for three months',
+        six_months_overdue: 'Rent has been overdue for six months',
+      };
+      const property = reminder.payment.unit.property;
+      const landlordName = `${property.landlord.firstName} ${property.landlord.lastName}`.trim();
+      const amount = new Intl.NumberFormat('en-NG', { style: 'currency', currency: 'NGN', maximumFractionDigits: 0 }).format(reminder.payment.amount);
+      const dueDate = reminder.payment.dueDate.toLocaleDateString('en-NG', { dateStyle: 'long', timeZone: 'Africa/Lagos' });
+      const subject = `Rent reminder: ${kindLabels[reminder.kind]}`;
+      const body = `Hello ${tenant.firstName},\n\n${kindLabels[reminder.kind]}.\n\nAmount: ${amount}\nDue date: ${dueDate}\nProperty: ${property.name}, Unit ${reminder.payment.unit.number}\nLandlord: ${landlordName}\n\nSign in to your PropManage tenant portal for details. If you have already paid, contact your landlord so the payment record can be updated.`;
+      const delivered = await sendAccountEmail(tenant.email, subject, body, undefined, `rent-reminder:${reminder.id}`);
+      if (delivered) {
+        await prisma.rentReminder.update({ where: { id: reminder.id }, data: { status: 'sent', processingAt: null, sentAt: new Date(), lastError: null } });
+        continue;
+      }
+
+      const attempts = reminder.attempts + 1;
+      const retryAt = new Date(Date.now() + Math.min(24 * 60 * 60 * 1000, 5 * 60 * 1000 * (2 ** attempts)));
+      await prisma.rentReminder.update({
+        where: { id: reminder.id },
+        data: { status: attempts >= 5 ? 'failed' : 'pending', processingAt: null, scheduledAt: retryAt, lastError: 'email_delivery_failed' },
+      });
+    }
+  } catch (error) {
+    console.error('Rent reminder worker failed:', error instanceof Error ? error.message : 'database error');
+  }
+}
+
+let rentReminderCycleRunning = false;
+async function runRentReminderCycle() {
+  if (rentReminderCycleRunning) return;
+  rentReminderCycleRunning = true;
+  try {
+    await scheduleExistingRentReminders();
+    await processRentReminders();
+  } catch (error) {
+    console.error('Unable to run rent reminder cycle:', error instanceof Error ? error.message : 'database error');
+  } finally {
+    rentReminderCycleRunning = false;
   }
 }
 
@@ -844,7 +993,10 @@ async function startServer() {
         prisma.emailDeliveryEvent.findFirst({ orderBy: [{ occurredAt: 'desc' }, { receivedAt: 'desc' }] }),
         prisma.emailDeliveryEvent.count({ where: { occurredAt: { gte: since }, eventType: { in: ['email.delivery_delayed', 'email.bounced', 'email.failed', 'email.suppressed', 'email.complained'] } } }),
       ]);
-      const delivery = failures24h > 0 || emailDeliveryState === 'degraded' ? 'degraded' : (latest ? 'healthy' : emailDeliveryState);
+      const recentLocalFailure = emailDeliveryState === 'degraded'
+        && emailLastEventAt !== null
+        && Date.parse(emailLastEventAt) >= since.getTime();
+      const delivery = failures24h > 0 || recentLocalFailure ? 'degraded' : (latest ? 'healthy' : emailDeliveryState);
       return res.json({
         status: delivery === 'degraded' ? 'degraded' : 'ok',
         uptime: process.uptime(),
@@ -1538,18 +1690,34 @@ async function startServer() {
       }
 
       const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-      await prisma.$transaction([
-        prisma.user.update({ where: { id: record.userId }, data: { passwordHash } }),
-        prisma.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-        prisma.refreshToken.updateMany({
+      await prisma.$transaction(async (tx) => {
+        const usedAt = new Date();
+        // Consume conditionally inside the same transaction as the password change. This makes
+        // concurrent submissions of the same reset link one-time: only one request can claim it.
+        const consumed = await tx.passwordResetToken.updateMany({
+          where: { id: record.id, usedAt: null, expiresAt: { gt: usedAt } },
+          data: { usedAt },
+        });
+        if (consumed.count !== 1) {
+          throw new Error('PASSWORD_RESET_TOKEN_ALREADY_USED');
+        }
+        await tx.user.update({ where: { id: record.userId }, data: { passwordHash } });
+        await tx.passwordResetToken.updateMany({
+          where: { userId: record.userId, id: { not: record.id }, usedAt: null },
+          data: { usedAt },
+        });
+        await tx.refreshToken.updateMany({
           where: { userId: record.userId, revokedAt: null },
-          data: { revokedAt: new Date(), revokedReason: 'password_reset' },
-        }),
-      ]);
+          data: { revokedAt: usedAt, revokedReason: 'password_reset' },
+        });
+      });
 
       clearAuthCookies(res);
       return res.json({ success: true, message: 'Password updated. Sign in with the new password.' });
     } catch (error) {
+      if (error instanceof Error && error.message === 'PASSWORD_RESET_TOKEN_ALREADY_USED') {
+        return res.status(400).json({ success: false, error: 'This reset link is invalid or has expired. Request a new one.' });
+      }
       console.error('Unable to complete password reset:', error);
       return res.status(503).json({ success: false, error: 'Password reset is temporarily unavailable.' });
     }
@@ -2068,6 +2236,7 @@ async function startServer() {
           accepted: false,
           expiresAt: { gt: new Date() },
         },
+        include: { landlord: { select: { firstName: true, lastName: true } } },
       });
       if (!invite) return null;
       const unit = await prisma.unit.findUnique({ where: { id: invite.unitId } });
@@ -2081,9 +2250,12 @@ async function startServer() {
           email: invite.email,
           firstName: invite.firstName,
           lastName: invite.lastName,
+          landlordName: `${invite.landlord.firstName} ${invite.landlord.lastName}`.trim(),
           propertyName: property.name,
           unitNumber: unit.number,
           rent: unit.rent,
+          leaseStart: invite.leaseStart?.toISOString().split('T')[0] ?? null,
+          leaseEnd: invite.leaseEnd?.toISOString().split('T')[0] ?? null,
           expiresAt: invite.expiresAt.getTime(),
         },
       };
@@ -2101,43 +2273,46 @@ async function startServer() {
   app.post('/api/tenant-invitations/:token/accept', inviteAcceptLimiter, async (req, res) => {
     const tokenHash = createHash('sha256').update(req.params.token).digest('hex');
 
-    const dbResult = await readDatabaseOrFallback(undefined, async () => {
-      const invite = await prisma.tenantInvitation.findFirst({
-        where: {
-          tokenHash,
-          accepted: false,
-          expiresAt: { gt: new Date() },
-        },
+    const dbResult = await readDatabaseOrFallback(undefined, async () => prisma.$transaction(async (tx) => {
+      const invite = await tx.tenantInvitation.findFirst({
+        where: { tokenHash, accepted: false, expiresAt: { gt: new Date() } },
       });
-      if (!invite) return { type: 'error', status: 404, message: 'This invitation is invalid or has expired.' };
+      if (!invite) return { type: 'error' as const, status: 404, message: 'This invitation is invalid or has expired.' };
 
       const password = sanitizeString(req.body.password);
       if (!isStrongPassword(password)) {
-        return { type: 'error', status: 400, message: 'Password must be at least 8 characters long.' };
+        return { type: 'error' as const, status: 400, message: 'Password must be 12-72 UTF-8 bytes.' };
       }
-      if (await prisma.user.findUnique({ where: { email: invite.email } })) {
-        return { type: 'error', status: 409, message: 'An account already exists for this invitation email.' };
+      if (await tx.user.findUnique({ where: { email: invite.email }, select: { id: true } })) {
+        return { type: 'error' as const, status: 409, message: 'An account already exists for this invitation email.' };
       }
 
-      const unit = await prisma.unit.findUnique({
-        where: { id: invite.unitId },
-        include: { property: true },
-      });
+      const unit = await tx.unit.findUnique({ where: { id: invite.unitId }, include: { property: true } });
       if (!unit || !unit.property || unit.property.landlordId !== invite.landlordId || unit.status !== 'vacant' || unit.tenantId) {
-        return { type: 'error', status: 409, message: 'The unit is no longer available. Contact your landlord.' };
+        return { type: 'error' as const, status: 409, message: 'The unit is no longer available. Contact your landlord.' };
       }
 
-      const newUser = await prisma.user.create({
+      // Claim the vacant unit inside this transaction. Concurrent invitation accepts cannot
+      // create two tenants for one unit, and any later failure rolls the claim back.
+      const claimedUnit = await tx.unit.updateMany({
+        where: { id: unit.id, status: 'vacant', tenantId: null },
+        data: { status: 'occupied' },
+      });
+      if (claimedUnit.count !== 1) {
+        return { type: 'error' as const, status: 409, message: 'The unit is no longer available. Contact your landlord.' };
+      }
+
+      const newUser = await tx.user.create({
         data: {
           firstName: invite.firstName,
           lastName: invite.lastName,
           email: invite.email,
           role: 'tenant',
-          passwordHash: await bcrypt.hash(password, 10),
+          passwordHash: await bcrypt.hash(password, BCRYPT_ROUNDS),
         },
       });
 
-      const tenant = await prisma.tenant.create({
+      const tenant = await tx.tenant.create({
         data: {
           landlordId: invite.landlordId,
           userId: newUser.id,
@@ -2153,28 +2328,16 @@ async function startServer() {
         },
       });
 
-      await prisma.unit.update({
-        where: { id: unit.id },
-        data: {
-          tenantId: tenant.id,
-          status: 'occupied',
-        },
-      });
-
-      await prisma.property.update({
-        where: { id: unit.propertyId },
-        data: {
-          occupancy: { increment: 1 },
-        },
-      });
-
-      await prisma.tenantInvitation.update({
-        where: { id: invite.id },
+      await tx.unit.update({ where: { id: unit.id }, data: { tenantId: tenant.id } });
+      await tx.property.update({ where: { id: unit.propertyId }, data: { occupancy: { increment: 1 } } });
+      const acceptedInvite = await tx.tenantInvitation.updateMany({
+        where: { id: invite.id, accepted: false, expiresAt: { gt: new Date() } },
         data: { accepted: true },
       });
+      if (acceptedInvite.count !== 1) throw new Error('Invitation acceptance lost a concurrent update.');
 
       return {
-        type: 'success',
+        type: 'success' as const,
         status: 201,
         data: {
           user: {
@@ -2186,7 +2349,7 @@ async function startServer() {
           },
         },
       };
-    });
+    }));
 
     if (dbResult && dbResult.type === 'error') {
       return res.status(dbResult.status).json({ success: false, error: dbResult.message });
@@ -3245,10 +3408,18 @@ async function startServer() {
 
       const records = await prisma.tenant.findMany({
         where,
-        include: { landlord: { select: { id: true, firstName: true, lastName: true } } },
+        include: {
+          landlord: { select: { id: true, firstName: true, lastName: true, email: true, phone: true } },
+          unit: {
+            select: {
+              number: true,
+              property: { select: { name: true, address: true, city: true, state: true } },
+            },
+          },
+        },
         orderBy: { createdAt: 'desc' },
       });
-      return records.map((record) => ({ ...mapDbTenant(record), landlord: record.landlord }));
+      return records.map((record) => ({ ...mapDbTenant(record), landlord: record.landlord, unitDetails: record.unit }));
     });
 
     if (dbTenants !== undefined) {
@@ -3516,6 +3687,48 @@ async function startServer() {
     return res.status(503).json({ success: false, error: 'Payments are temporarily unavailable. Please try again shortly.' });
   });
 
+  app.get('/api/rent-reminders', requireRole('tenant'), async (req, res) => {
+    const user = (req as AuthRequest).user!;
+    try {
+      const tenant = await prisma.tenant.findFirst({ where: { userId: user.sub }, select: { id: true } });
+      if (!tenant) return res.json({ success: true, data: [] });
+      const reminders = await prisma.rentReminder.findMany({
+        where: {
+          payment: { is: { tenantId: tenant.id } },
+          status: { in: ['sent', 'failed'] },
+        },
+        include: {
+          payment: {
+            select: {
+              amount: true,
+              dueDate: true,
+              unit: { select: { number: true, property: { select: { name: true } } } },
+            },
+          },
+        },
+        orderBy: [{ sentAt: 'desc' }, { scheduledAt: 'desc' }],
+        take: 50,
+      });
+      return res.json({
+        success: true,
+        data: reminders.map((reminder) => ({
+          id: reminder.id,
+          kind: reminder.kind,
+          status: reminder.status,
+          sentAt: reminder.sentAt?.toISOString() ?? null,
+          scheduledAt: reminder.scheduledAt.toISOString(),
+          amount: reminder.payment.amount,
+          dueDate: reminder.payment.dueDate.toISOString().split('T')[0],
+          propertyName: reminder.payment.unit.property.name,
+          unitNumber: reminder.payment.unit.number,
+        })),
+      });
+    } catch (error) {
+      console.error('Unable to load tenant rent notices:', error instanceof Error ? error.message : 'database error');
+      return res.status(503).json({ success: false, error: 'Rent notices are temporarily unavailable.' });
+    }
+  });
+
   app.post('/api/payments', requireRole('landlord', 'admin'), async (req, res) => {
     const user = (req as AuthRequest).user!;
     const { tenantId, unitId, dueDate, paidDate, status, method } = req.body;
@@ -3561,16 +3774,20 @@ async function startServer() {
         }
       }
 
-      const record = await prisma.payment.create({
-        data: {
-          tenantId: tenant.id,
-          unitId: unit.id,
-          amount,
-          dueDate: new Date(String(dueDate)),
-          paidDate: paidDate ? new Date(String(paidDate)) : null,
-          status: (status || (paidDate ? 'paid' : 'pending')) as 'paid' | 'pending' | 'overdue',
-          method: sanitizeString(method) || 'Manual',
-        },
+      const record = await prisma.$transaction(async (tx) => {
+        const payment = await tx.payment.create({
+          data: {
+            tenantId: tenant.id,
+            unitId: unit.id,
+            amount,
+            dueDate: new Date(String(dueDate)),
+            paidDate: paidDate ? new Date(String(paidDate)) : null,
+            status: (status || (paidDate ? 'paid' : 'pending')) as 'paid' | 'pending' | 'overdue',
+            method: sanitizeString(method) || 'Manual',
+          },
+        });
+        if (payment.status !== 'paid') await scheduleRentReminders(tx, payment.id, payment.dueDate);
+        return payment;
       });
 
       return res.status(201).json({
@@ -3877,6 +4094,12 @@ async function startServer() {
     }
   });
 
+  // API calls should never fall through to Vite's HTML app shell. Returning JSON here makes
+  // routing mistakes diagnosable instead of surfacing as "Unexpected token '<'" in the client.
+  app.use('/api', (req, res) => {
+    return res.status(404).json({ success: false, error: `API route not found: ${req.method} ${req.path}` });
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -3902,6 +4125,10 @@ async function startServer() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
+
+  void runRentReminderCycle();
+  const rentReminderTimer = setInterval(() => { void runRentReminderCycle(); }, 15 * 60 * 1000);
+  rentReminderTimer.unref();
 }
 
 startServer();

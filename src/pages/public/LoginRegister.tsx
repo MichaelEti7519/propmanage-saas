@@ -95,7 +95,16 @@ export function LoginRegister() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
+
+      if (!data || typeof data !== 'object') {
+        const contentType = response.headers.get('content-type') || 'unknown content type';
+        setMessage({
+          type: 'error',
+          text: `The server returned an unexpected response (HTTP ${response.status}, ${contentType}). Restart the PropManage server and make sure this page is using the same port.`,
+        });
+        return;
+      }
 
       if (!response.ok || !data.success) {
         setMessage({ type: 'error', text: data?.error || 'Unable to complete authentication.' });

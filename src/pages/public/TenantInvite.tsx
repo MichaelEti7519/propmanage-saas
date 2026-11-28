@@ -7,11 +7,20 @@ interface InviteDetails {
   email: string;
   firstName: string;
   lastName: string;
+  landlordName: string;
   propertyName: string;
   unitNumber: string;
   rent: number;
+  leaseStart?: string | null;
+  leaseEnd?: string | null;
   expiresAt: number;
 }
+
+const formatNaira = (amount: number) => new Intl.NumberFormat('en-NG', {
+  style: 'currency',
+  currency: 'NGN',
+  maximumFractionDigits: 0,
+}).format(amount);
 
 export function TenantInvite() {
   const { token } = useParams();
@@ -49,8 +58,8 @@ export function TenantInvite() {
   const handleAccept = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!token) return;
-    if (password.length < 8) {
-      setError('Use a password with at least 8 characters.');
+    if (new TextEncoder().encode(password.trim()).length < 12 || new TextEncoder().encode(password.trim()).length > 72) {
+      setError('Use a password between 12 and 72 UTF-8 bytes.');
       return;
     }
     if (password !== confirmPassword) {
@@ -94,13 +103,15 @@ export function TenantInvite() {
               <div className="mb-5 flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600"><Building className="h-5 w-5" /></div>
               <p className="text-sm font-semibold uppercase text-indigo-600">Tenant invitation</p>
               <h1 className="mt-2 text-2xl font-bold text-slate-900">Welcome, {invite.firstName}</h1>
-              <p className="mt-2 text-slate-600">Your landlord invited you to join the tenant portal.</p>
+              <p className="mt-2 text-slate-600">{invite.landlordName} invited you to join the tenant portal.</p>
             </div>
 
             <div className="space-y-3 border-b border-slate-100 bg-slate-50 p-6 sm:px-8">
               <div className="flex justify-between gap-4 text-sm"><span className="text-slate-500">Email</span><span className="font-medium text-slate-900">{invite.email}</span></div>
               <div className="flex justify-between gap-4 text-sm"><span className="text-slate-500">Property</span><span className="text-right font-medium text-slate-900">{invite.propertyName}, Unit {invite.unitNumber}</span></div>
-              <div className="flex justify-between gap-4 text-sm"><span className="text-slate-500">Monthly rent</span><span className="font-medium text-slate-900">${invite.rent.toLocaleString()}</span></div>
+              <div className="flex justify-between gap-4 text-sm"><span className="text-slate-500">Monthly rent</span><span className="font-medium text-slate-900">{formatNaira(invite.rent)}</span></div>
+              {invite.leaseStart && <div className="flex justify-between gap-4 text-sm"><span className="text-slate-500">Lease starts</span><span className="font-medium text-slate-900">{new Date(invite.leaseStart).toLocaleDateString('en-NG')}</span></div>}
+              {invite.leaseEnd && <div className="flex justify-between gap-4 text-sm"><span className="text-slate-500">Lease ends</span><span className="font-medium text-slate-900">{new Date(invite.leaseEnd).toLocaleDateString('en-NG')}</span></div>}
               <div className="flex justify-between gap-4 text-sm"><span className="text-slate-500">Link expires</span><span className="text-right font-medium text-slate-900">{new Date(invite.expiresAt).toLocaleDateString()}</span></div>
             </div>
 

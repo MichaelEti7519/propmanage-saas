@@ -45,6 +45,12 @@ interface PropertyRecord {
   name: string;
 }
 
+const formatNaira = (amount: number) => new Intl.NumberFormat('en-NG', {
+  style: 'currency',
+  currency: 'NGN',
+  maximumFractionDigits: 0,
+}).format(amount);
+
 const displayStatus = (value: PaymentRecord['status']) =>
   value === 'paid' ? 'Paid' : value === 'pending' ? 'Pending' : 'Overdue';
 
@@ -184,7 +190,7 @@ export const LandlordPayments = () => {
               <DollarSign className="w-8 h-8 text-emerald-600" />
               Rent & Payments
             </h1>
-            <p className="text-slate-500 mt-1">Track rental income, pending payments, and overdues.</p>
+            <p className="text-slate-500 mt-1">Track rent records. Adding a record here does not collect or transfer money.</p>
           </div>
           <button className="px-4 py-2.5 bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-xl font-medium shadow-sm transition-colors flex items-center gap-2">
             <Download className="w-4 h-4" />
@@ -198,7 +204,7 @@ export const LandlordPayments = () => {
               <CheckCircle2 className="w-6 h-6" />
             </div>
             <p className="text-sm font-medium text-slate-500">Collected</p>
-            <h3 className="text-2xl font-black text-slate-900 mt-1">${totalCollected.toLocaleString()}</h3>
+            <h3 className="text-2xl font-black text-slate-900 mt-1">{formatNaira(totalCollected)}</h3>
           </div>
 
           <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
@@ -206,7 +212,7 @@ export const LandlordPayments = () => {
               <Clock className="w-6 h-6" />
             </div>
             <p className="text-sm font-medium text-slate-500">Pending</p>
-            <h3 className="text-2xl font-black text-slate-900 mt-1">${totalPending.toLocaleString()}</h3>
+            <h3 className="text-2xl font-black text-slate-900 mt-1">{formatNaira(totalPending)}</h3>
           </div>
 
           <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
@@ -214,7 +220,7 @@ export const LandlordPayments = () => {
               <AlertCircle className="w-6 h-6" />
             </div>
             <p className="text-sm font-medium text-slate-500">Overdue</p>
-            <h3 className="text-2xl font-black text-slate-900 mt-1">${totalOverdue.toLocaleString()}</h3>
+            <h3 className="text-2xl font-black text-slate-900 mt-1">{formatNaira(totalOverdue)}</h3>
           </div>
         </div>
 
@@ -341,7 +347,7 @@ export const LandlordPayments = () => {
                         <div className="text-sm text-slate-500">{new Date(payment.dueDate).toLocaleDateString()}</div>
                       </td>
                       <td className="py-4 px-6">
-                        <div className="font-bold text-slate-900">${Number(payment.amount).toLocaleString()}</div>
+                        <div className="font-bold text-slate-900">{formatNaira(Number(payment.amount))}</div>
                       </td>
                       <td className="py-4 px-6">
                         <div className={cn(

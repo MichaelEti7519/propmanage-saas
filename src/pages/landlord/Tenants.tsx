@@ -26,6 +26,12 @@ interface LandlordTenant {
   leaseStatus?: string;
 }
 
+const formatNaira = (amount: number) => new Intl.NumberFormat('en-NG', {
+  style: 'currency',
+  currency: 'NGN',
+  maximumFractionDigits: 0,
+}).format(amount);
+
 export function LandlordTenants() {
   const { fetchWithAuth } = useAuth();
   const [tenants, setTenants] = useState<LandlordTenant[]>([]);
@@ -814,7 +820,7 @@ export function LandlordTenants() {
                 <option value="">Select a vacant unit...</option>
                 {availableUnits.map((unit) => (
                   <option key={unit.id} value={unit.id}>
-                    {unit.property} - Unit {unit.number} - ${unit.rent.toLocaleString()}/mo
+                    {unit.property} - Unit {unit.number} - {formatNaira(unit.rent)}/mo
                   </option>
                 ))}
               </select>

@@ -45,6 +45,8 @@ export function TenantHomes() {
   const [requests, setRequests] = useState<ViewingRequest[]>([]);
   const [activeTab, setActiveTab] = useState<'homes' | 'requests'>('homes');
   const [search, setSearch] = useState('');
+  const [cityFilter, setCityFilter] = useState('');
+  const [stateFilter, setStateFilter] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -83,13 +85,19 @@ export function TenantHomes() {
 
   const filteredListings = useMemo(() => {
     const query = search.trim().toLowerCase();
-    if (!query) return listings;
     return listings.filter((listing) =>
-      `${listing.property.name} ${listing.property.city} ${listing.property.state} ${listing.number}`
-        .toLowerCase()
-        .includes(query),
+      (!query || `${listing.property.name} ${listing.property.city} ${listing.property.state} ${listing.number}`
+        .toLowerCase().includes(query)) &&
+      (!cityFilter || listing.property.city === cityFilter) &&
+      (!stateFilter || listing.property.state === stateFilter),
     );
-  }, [listings, search]);
+  }, [listings, search, cityFilter, stateFilter]);
+
+  const availableCities = useMemo(() => [...new Set(listings
+    .filter((listing) => !stateFilter || listing.property.state === stateFilter)
+    .map((listing) => listing.property.city))].sort((a, b) => a.localeCompare(b)), [listings, stateFilter]);
+  const availableStates = useMemo(() => [...new Set(listings.map((listing) => listing.property.state))]
+    .sort((a, b) => a.localeCompare(b)), [listings]);
 
   const activeRequestsByUnit = new Map(
     requests
@@ -152,10 +160,27 @@ export function TenantHomes() {
 
         {activeTab === 'homes' ? (
           <section aria-label="Available homes" className="space-y-5">
-            <label className="relative block max-w-md">
-              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#756B61]" />
-              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by property or area" className="w-full border border-[#E8DDCC] bg-white py-2.5 pl-9 pr-3 text-sm text-[#332D29] outline-none focus:border-[#397451]" />
-            </label>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(16rem,1fr)_14rem_14rem]">
+              <label className="relative block">
+                <span className="sr-only">Search by property or area</span>
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#756B61]" />
+                <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search by property or area" className="w-full border border-[#E8DDCC] bg-white py-2.5 pl-9 pr-3 text-sm text-[#332D29] outline-none focus:border-[#397451]" />
+              </label>
+              <label>
+                <span className="sr-only">Filter by state</span>
+                <select value={stateFilter} onChange={(event) => { setStateFilter(event.target.value); setCityFilter(''); }} className="w-full border border-[#E8DDCC] bg-white px-3 py-2.5 text-sm text-[#332D29] outline-none focus:border-[#397451]">
+                  <option value="">All states</option>
+                  {availableStates.map((state) => <option key={state} value={state}>{state}</option>)}
+                </select>
+              </label>
+              <label>
+                <span className="sr-only">Filter by city</span>
+                <select value={cityFilter} onChange={(event) => setCityFilter(event.target.value)} className="w-full border border-[#E8DDCC] bg-white px-3 py-2.5 text-sm text-[#332D29] outline-none focus:border-[#397451]">
+                  <option value="">All cities</option>
+                  {availableCities.map((city) => <option key={city} value={city}>{city}</option>)}
+                </select>
+              </label>
+            </div>
 
             {loading ? (
               <p className="py-10 text-center text-sm text-[#756B61]">Loading homes...</p>

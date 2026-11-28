@@ -6,23 +6,17 @@ import { ReportModal } from '../../components/ReportModal';
 import { useAuth } from '../../hooks/useAuth';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
-// Mock Landlord Data for the context
-const MOCK_LANDLORD = {
-  name: "Acme Property Management",
-  agentName: "Sarah Jenkins",
-  phone: "(555) 123-4567",
-  email: "support@acmeproperties.com",
-};
-
-// Mock Lease Data
-const MOCK_LEASE = {
-  unit: "Apt 4B - The Grand",
-  address: "123 Main St, Springfield, IL 62701",
-  rentAmount: 2400,
-  nextPaymentDate: "2026-06-20", // Mocked to be within 5 days of today (June 16, 2026)
-  leaseEnd: "2026-10-31",
-  status: "Active"
-};
+interface TenantHomeData {
+  firstName: string;
+  lastName: string;
+  status: string;
+  rent: number;
+  leaseEnd?: string;
+  unitDetails?: {
+    number: string;
+    property: { name: string; address: string; city: string; state: string };
+  } | null;
+}
 
 const INITIAL_CHECKLIST = [
   { id: '1', title: 'Provide Proof of Renter\'s Insurance', completed: false, description: 'Upload your insurance policy document.' },
@@ -39,28 +33,61 @@ const MOCK_PAYMENT_TRENDS = [
   { month: 'Jun', balance: 0, paid: 2400 },
 ];
 
+const formatNaira = (amount: number) => new Intl.NumberFormat('en-NG', {
+  style: 'currency',
+  currency: 'NGN',
+  maximumFractionDigits: 0,
+}).format(amount);
+
 
 export const TenantDashboard = () => {
-  const { fetchWithAuth } = useAuth();
+  const { fetchWithAuth, user } = useAuth();
   const [checklist, setChecklist] = useState(INITIAL_CHECKLIST);
   const [reportTarget, setReportTarget] = useState<{ targetType: 'tenant' | 'landlord'; targetId: string; targetName: string } | null>(null);
-  const [linkedLandlord, setLinkedLandlord] = useState<{ id: string; name: string } | null>(null);
+  const [tenantHome, setTenantHome] = useState<TenantHomeData | null>(null);
+  const [linkedLandlord, setLinkedLandlord] = useState<{ id: string; name: string; phone?: string | null; email?: string | null } | null>(null);
+  const [upcomingRent, setUpcomingRent] = useState<{ amount: number; dueDate: string } | null>(null);
 
   useEffect(() => {
-    async function loadLinkedLandlord() {
+    async function loadTenantDetails() {
       try {
         const response = await fetchWithAuth('/api/tenants');
         const data = await response.json();
         if (!response.ok || !data.success || !Array.isArray(data.data)) return;
-        const landlord = data.data[0]?.landlord;
+        const tenant = data.data[0];
+        if (tenant) setTenantHome(tenant as TenantHomeData);
+        const landlord = tenant?.landlord;
         if (landlord?.id) {
-          setLinkedLandlord({ id: landlord.id, name: `${landlord.firstName} ${landlord.lastName}` });
+          setLinkedLandlord({
+            id: landlord.id,
+            name: `${landlord.firstName} ${landlord.lastName}`.trim(),
+            phone: landlord.phone,
+            email: landlord.email,
+          });
         }
       } catch {
+        setTenantHome(null);
         setLinkedLandlord(null);
       }
     }
-    loadLinkedLandlord();
+    loadTenantDetails();
+  }, [fetchWithAuth]);
+
+  useEffect(() => {
+    async function loadUpcomingRent() {
+      try {
+        const response = await fetchWithAuth('/api/payments');
+        const data = await response.json();
+        if (!response.ok || !data.success || !Array.isArray(data.data)) return;
+        const payment = data.data
+          .filter((record: { status: string }) => record.status !== 'paid')
+          .sort((a: { dueDate: string }, b: { dueDate: string }) => a.dueDate.localeCompare(b.dueDate))[0];
+        setUpcomingRent(payment ? { amount: Number(payment.amount), dueDate: payment.dueDate } : null);
+      } catch {
+        setUpcomingRent(null);
+      }
+    }
+    void loadUpcomingRent();
   }, [fetchWithAuth]);
 
   const toggleChecklist = (id: string) => {
@@ -70,12 +97,15 @@ export const TenantDashboard = () => {
   const completedCount = checklist.filter(item => item.completed).length;
   const progress = Math.round((completedCount / checklist.length) * 100);
 
-  // Payment Reminder Logic
-  const nextPaymentDate = new Date(MOCK_LEASE.nextPaymentDate);
-  const today = new Date('2026-06-16T00:00:00'); // using the known 'current' localized time or use new Date()
-  const timeDiff = nextPaymentDate.getTime() - today.getTime();
-  const daysUntilDue = Math.ceil(timeDiff / (1000 * 3600 * 24));
-  const showPaymentReminder = daysUntilDue <= 5 && daysUntilDue >= 0;
+  const nextPaymentDate = upcomingRent ? new Date(`${upcomingRent.dueDate}T00:00:00`) : null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const daysUntilDue = nextPaymentDate ? Math.ceil((nextPaymentDate.getTime() - today.getTime()) / 86400000) : null;
+  const showPaymentReminder = daysUntilDue !== null && daysUntilDue <= 30 && daysUntilDue >= 0;
+  const tenantUnit = tenantHome?.unitDetails
+    ? `Unit ${tenantHome.unitDetails.number} - ${tenantHome.unitDetails.property.name}`
+    : 'No unit is linked to this account';
+  const landlordInitials = linkedLandlord?.name.split(/\s+/).map((part) => part[0]).slice(0, 2).join('').toUpperCase() || '—';
 
   return (
     <div className="p-4 sm:p-8 flex-1 overflow-y-auto mb-16 md:mb-0 bg-slate-50">
@@ -100,12 +130,12 @@ export const TenantDashboard = () => {
               <div>
                 <h3 className="font-bold text-amber-900">Rent Payment Due Soon</h3>
                 <p className="text-sm text-amber-700 mt-1">
-                  Your upcoming rent payment of <span className="font-bold">${MOCK_LEASE.rentAmount.toLocaleString()}</span> is due in {daysUntilDue} day{daysUntilDue !== 1 ? 's' : ''} (on {nextPaymentDate.toLocaleDateString()}).
+                  Your upcoming rent payment of <span className="font-bold">{formatNaira(upcomingRent!.amount)}</span> is due in {daysUntilDue} day{daysUntilDue !== 1 ? 's' : ''} (on {nextPaymentDate!.toLocaleDateString('en-NG')}).
                 </p>
               </div>
             </div>
             <Link to="/tenant/payments" className="w-full sm:w-auto px-5 py-2.5 bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold rounded-xl shadow-sm transition-colors text-center whitespace-nowrap">
-              Pay Now
+              View payment details
             </Link>
           </div>
         )}
@@ -113,20 +143,20 @@ export const TenantDashboard = () => {
         {/* Welcome Section */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">Welcome home, Michael</h1>
+            <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">Welcome home, {user?.firstName ?? tenantHome?.firstName ?? 'Tenant'}</h1>
             <p className="text-slate-500 mt-1 flex items-center gap-2">
-               <Home className="w-4 h-4" /> {MOCK_LEASE.unit} 
+               <Home className="w-4 h-4" /> {tenantUnit}
             </p>
           </div>
           
           {/* Landlord Identification Badge */}
           <div className="bg-white p-3 sm:px-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-3 w-fit">
             <div className="w-10 h-10 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold">
-              AP
+              {landlordInitials}
             </div>
             <div>
               <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Managed By</p>
-              <p className="text-sm font-bold text-slate-900">{MOCK_LANDLORD.name}</p>
+              <p className="text-sm font-bold text-slate-900">{linkedLandlord?.name ?? 'No landlord linked yet'}</p>
             </div>
           </div>
         </div>
@@ -163,21 +193,21 @@ export const TenantDashboard = () => {
                   <div>
                     <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-1">Upcoming Payment</h2>
                     <div className="text-3xl font-black text-slate-900 tracking-tight mb-2">
-                      ${MOCK_LEASE.rentAmount.toLocaleString()}
+                      {upcomingRent ? formatNaira(upcomingRent.amount) : formatNaira(0)}
                     </div>
-                    <p className="text-slate-600 font-medium">Due on {new Date(MOCK_LEASE.nextPaymentDate).toLocaleDateString()}</p>
+                    <p className="text-slate-600 font-medium">{nextPaymentDate ? `Due on ${nextPaymentDate.toLocaleDateString('en-NG')}` : 'No upcoming payment'}</p>
                   </div>
                 </div>
                 
-                <button className="w-full sm:w-auto px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl shadow-sm transition-colors text-center whitespace-nowrap">
-                  Pay Now
-                </button>
+                <Link to="/tenant/payments" className="w-full sm:w-auto px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl shadow-sm transition-colors text-center whitespace-nowrap">
+                  View payments
+                </Link>
               </div>
             </div>
 
             {/* Quick Actions */}
             <div className="grid grid-cols-2 gap-4">
-              <button className="bg-white p-4 sm:p-6 rounded-2xl border border-slate-200 shadow-sm hover:border-indigo-300 hover:shadow-md transition-all text-left flex flex-col items-start gap-4">
+              <Link to="/tenant/maintenance" className="bg-white p-4 sm:p-6 rounded-2xl border border-slate-200 shadow-sm hover:border-indigo-300 hover:shadow-md transition-all text-left flex flex-col items-start gap-4">
                  <div className="w-10 h-10 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center">
                    <AlertCircle className="w-5 h-5" />
                  </div>
@@ -185,8 +215,8 @@ export const TenantDashboard = () => {
                    <h3 className="font-bold text-slate-900">Request Maintenance</h3>
                    <p className="text-sm text-slate-500 mt-1 line-clamp-1">Submit a new repair request</p>
                  </div>
-              </button>
-              <button className="bg-white p-4 sm:p-6 rounded-2xl border border-slate-200 shadow-sm hover:border-indigo-300 hover:shadow-md transition-all text-left flex flex-col items-start gap-4">
+              </Link>
+              <Link to="/tenant/documents" className="bg-white p-4 sm:p-6 rounded-2xl border border-slate-200 shadow-sm hover:border-indigo-300 hover:shadow-md transition-all text-left flex flex-col items-start gap-4">
                  <div className="w-10 h-10 bg-emerald-50 text-emerald-600 rounded-xl flex items-center justify-center">
                    <FileText className="w-5 h-5" />
                  </div>
@@ -194,14 +224,14 @@ export const TenantDashboard = () => {
                    <h3 className="font-bold text-slate-900">View Lease</h3>
                    <p className="text-sm text-slate-500 mt-1 line-clamp-1">Review your current lease</p>
                  </div>
-              </button>
+              </Link>
             </div>
 
             {/* Payment Trends Chart */}
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden p-6">
                <h3 className="font-bold text-slate-900 text-lg mb-6 flex items-center gap-2">
                  <TrendingUp className="w-5 h-5 text-indigo-500" />
-                 Payment Trends (Last 6 Months)
+                 Sample payment trends (illustrative only)
                </h3>
                <div className="h-72 w-full">
                  <ResponsiveContainer width="100%" height="100%">
@@ -221,12 +251,12 @@ export const TenantDashboard = () => {
                        axisLine={false} 
                        tickLine={false} 
                        tick={{ fill: '#64748b', fontSize: 12 }}
-                       tickFormatter={(value) => `$${value}`}
+                       tickFormatter={(value) => formatNaira(Number(value))}
                        dx={-10}
                      />
                      <Tooltip 
                        contentStyle={{ borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
-                       formatter={(value) => [`$${value}`, '']}
+                       formatter={(value) => [formatNaira(Number(value)), '']}
                      />
                      <Legend iconType="circle" wrapperStyle={{ paddingTop: '20px', fontSize: '13px' }} />
                      <Line 
@@ -258,7 +288,7 @@ export const TenantDashboard = () => {
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
                   <h3 className="font-bold text-slate-900 flex items-center gap-2">
                     <CheckCircle2 className="w-5 h-5 text-indigo-500" />
-                    Move-In Checklist
+                    Sample move-in checklist (not saved yet)
                   </h3>
                   <span className="text-sm font-semibold text-slate-500">{completedCount} of {checklist.length} completed</span>
                 </div>
@@ -316,12 +346,11 @@ export const TenantDashboard = () => {
                <div className="space-y-4">
                  <div className="flex gap-4 items-start pb-4 border-b border-slate-100 last:border-0 last:pb-0">
                    <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center flex-shrink-0 font-bold text-xs">
-                     AP
+                     {landlordInitials}
                    </div>
                    <div>
-                     <h4 className="font-semibold text-slate-900 text-sm">{MOCK_LANDLORD.name}</h4>
-                     <p className="text-slate-600 text-sm mt-1">Water will be shut off for maintenance on Friday between 10am and 12pm. We apologize for any inconvenience.</p>
-                     <span className="text-xs text-slate-400 mt-2 block">2 days ago</span>
+                      <h4 className="font-semibold text-slate-900 text-sm">Property updates</h4>
+                      <p className="text-slate-600 text-sm mt-1">There are no property announcements yet.</p>
                    </div>
                  </div>
                </div>
@@ -340,29 +369,29 @@ export const TenantDashboard = () => {
               
               <div className="space-y-5">
                 <div>
-                  <p className="font-semibold text-slate-900">{MOCK_LANDLORD.name}</p>
-                  <p className="text-sm text-slate-500">Agent: {MOCK_LANDLORD.agentName}</p>
+                  <p className="font-semibold text-slate-900">{linkedLandlord?.name ?? 'No landlord linked yet'}</p>
+                  <p className="text-sm text-slate-500">Your landlord</p>
                 </div>
                 
                 <div className="flex flex-col gap-3">
-                  <a href={`tel:${MOCK_LANDLORD.phone}`} className="flex items-center gap-3 text-sm text-slate-700 hover:text-indigo-600 transition-colors p-2 rounded-lg hover:bg-slate-50 -mx-2">
+                  {linkedLandlord?.phone && <a href={`tel:${linkedLandlord.phone}`} className="flex items-center gap-3 text-sm text-slate-700 hover:text-indigo-600 transition-colors p-2 rounded-lg hover:bg-slate-50 -mx-2">
                     <div className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center flex-shrink-0">
                       <Phone className="w-4 h-4 text-slate-600" />
                     </div>
-                    {MOCK_LANDLORD.phone}
-                  </a>
-                  <a href={`mailto:${MOCK_LANDLORD.email}`} className="flex items-center gap-3 text-sm text-slate-700 hover:text-indigo-600 transition-colors p-2 rounded-lg hover:bg-slate-50 -mx-2 break-all">
+                    {linkedLandlord.phone}
+                  </a>}
+                  {linkedLandlord?.email && <a href={`mailto:${linkedLandlord.email}`} className="flex items-center gap-3 text-sm text-slate-700 hover:text-indigo-600 transition-colors p-2 rounded-lg hover:bg-slate-50 -mx-2 break-all">
                     <div className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center flex-shrink-0">
                       <Mail className="w-4 h-4 text-slate-600" />
                     </div>
-                    {MOCK_LANDLORD.email}
-                  </a>
+                    {linkedLandlord.email}
+                  </a>}
                 </div>
                 
                 <div className="pt-4 border-t border-slate-100">
-                  <button className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 text-sm font-semibold rounded-xl transition-colors">
-                    Send Message
-                  </button>
+                  <Link to="/tenant/messages" className="block w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 text-sm font-semibold rounded-xl transition-colors text-center">
+                    Open messages
+                  </Link>
                 </div>
               </div>
             </div>
@@ -376,15 +405,20 @@ export const TenantDashboard = () => {
               <div className="space-y-3 mt-4">
                  <div className="flex justify-between items-center text-sm">
                    <span className="text-slate-500">Status</span>
-                   <span className="font-semibold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-md border border-emerald-200">Active</span>
+                   <span className={cn(
+                     'font-semibold px-2.5 py-0.5 rounded-md border',
+                     tenantHome?.status?.toLowerCase() === 'active'
+                       ? 'text-emerald-600 bg-emerald-50 border-emerald-200'
+                       : 'text-slate-700 bg-slate-50 border-slate-200',
+                   )}>{tenantHome?.status ?? 'No tenancy linked'}</span>
                  </div>
                  <div className="flex justify-between items-center text-sm">
                    <span className="text-slate-500">Lease End</span>
-                   <span className="font-semibold text-slate-900">{new Date(MOCK_LEASE.leaseEnd).toLocaleDateString()}</span>
+                   <span className="font-semibold text-slate-900">{tenantHome?.leaseEnd ? new Date(`${tenantHome.leaseEnd}T00:00:00`).toLocaleDateString('en-NG') : 'Not set'}</span>
                  </div>
                  <div className="flex justify-between items-center text-sm">
                    <span className="text-slate-500">Rent amount</span>
-                   <span className="font-semibold text-slate-900">${MOCK_LEASE.rentAmount}/mo</span>
+                   <span className="font-semibold text-slate-900">{formatNaira(tenantHome?.rent ?? 0)} / lease term</span>
                  </div>
               </div>
             </div>
